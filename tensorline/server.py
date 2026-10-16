@@ -42,10 +42,16 @@ def create_app(engine: Engine) -> FastAPI:
         return {"object": "list", "data": [{"id": engine.model_id, "object": "model"}]}
 
     async def run(req: ChatRequest):
-        """Run generation in a worker thread; bridge deltas through an asyncio queue."""
+        """Yield (text delta, stats), then (None, stats) when generation ends."""
         prompt = engine.render_chat([m.model_dump() for m in req.messages])
         params = SamplingParams(req.max_tokens, req.temperature, req.top_p)
         stats = GenStats()
+        if hasattr(engine, "astream"):        # batch engine: native asyncio, no thread per request
+            async for delta in engine.astream(prompt, params, stats):
+                yield delta, stats
+            yield None, stats
+            return
+        # naive engine: run its blocking generator in a worker thread, bridge through a queue
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
 
@@ -93,13 +99,16 @@ def create_app(engine: Engine) -> FastAPI:
             chunk = {**base, "object": "chat.completion.chunk"}
             first = {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
             yield f"data: {json.dumps({**chunk, 'choices': [first]})}\n\n"
+            # Content frames are pre-rendered around the delta: one json.dumps of a string per
+            # event instead of serialising the whole chunk dict.
+            head = json.dumps(chunk)[:-1] + ', "choices": [{"index": 0, "delta": {"content": '
+            tail = '}, "finish_reason": null}]}\n\n'
             async for delta, stats in run(req):
                 if delta is None:
                     end = {"index": 0, "delta": {}, "finish_reason": stats.finish_reason}
                     yield f"data: {json.dumps({**chunk, 'choices': [end], 'usage': usage(stats)})}\n\n"
                 else:
-                    c = {"index": 0, "delta": {"content": delta}, "finish_reason": None}
-                    yield f"data: {json.dumps({**chunk, 'choices': [c]})}\n\n"
+                    yield "data: " + head + json.dumps(delta) + tail
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(sse(), media_type="text/event-stream")

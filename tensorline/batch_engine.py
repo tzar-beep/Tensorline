@@ -10,21 +10,43 @@ A single scheduler thread owns the GPU. Every iteration it:
   4. retires finished sequences and returns their blocks immediately.
 Requests therefore join and leave the batch at every step (iteration-level scheduling, as in
 Orca/vLLM) instead of waiting for a whole batch to drain.
+
+Output path: the scheduler never touches per-request threads. Sampled token ids are collected
+during a step and delivered at the end of it: to asyncio callers (`astream`, used by the server)
+with ONE `call_soon_threadsafe` wakeup per event loop per step, carrying every sequence's
+tokens; to sync callers (`stream`) through a queue. Detokenization happens on the consumer
+side, incrementally (see detok.py).
 """
 from __future__ import annotations
 
+import asyncio
 import itertools
 import queue
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import AsyncIterator, Iterator
 
 import torch
 
+from .detok import IncrementalDetokenizer
 from .engine import Engine, GenStats, SamplingParams, sample
 from .paged import BlockAllocator, PagedModel, SeqChunk, block_hash
+
+
+class _Sink:
+    """Where a sequence's outputs go: token ids, then None (done) or an Exception."""
+    __slots__ = ("q", "loop")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop | None = None):
+        self.loop = loop
+        self.q = queue.Queue() if loop is None else asyncio.Queue()
+
+
+def _deliver(batch):          # runs on the event loop thread
+    for q, item in batch:
+        q.put_nowait(item)
 
 
 @dataclass(eq=False)
@@ -34,7 +56,7 @@ class Sequence:
     tokens: list[int]
     params: SamplingParams
     stops: set[int]
-    out: queue.Queue
+    out: _Sink
     stats: GenStats
     t_submit: float
     blocks: list[int] = field(default_factory=list)
@@ -80,30 +102,86 @@ class BatchEngine(Engine):
         self.max_running_seen = 0
         self.prompt_tokens_total = 0
         self.prefix_hit_tokens = 0
+        self._pending: list[tuple[_Sink, object]] = []   # outputs produced during this step
+        self._aborted: list[Sequence] = []
         threading.Thread(target=self._loop, daemon=True, name="tl-scheduler").start()
 
-    # ---- public API (same shape as the naive Engine) ----
-    def stream(self, prompt: str, params: SamplingParams, stats: GenStats) -> Iterator[str]:
+    # ---- public API ----
+    def _submit(self, prompt: str, params: SamplingParams, stats: GenStats, sink: _Sink) -> Sequence:
         ids = self.tokenizer(prompt).input_ids
         if len(ids) >= self.max_model_len:
             raise ValueError(f"prompt has {len(ids)} tokens; max_model_len is {self.max_model_len}")
         seq = Sequence(next(self._ids), len(ids), list(ids), params,
-                       params.stop_token_ids or self.default_stops, queue.Queue(), stats,
+                       params.stop_token_ids or self.default_stops, sink, stats,
                        time.perf_counter())
         stats.prompt_tokens = len(ids)
         with self._cv:
             self.waiting.append(seq)
             self._cv.notify()
-        out_ids, emitted = [], ""
-        while (tok := seq.out.get()) is not None:
-            if isinstance(tok, Exception):
-                raise tok
-            out_ids.append(tok)
-            text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
-            if not text.endswith("�"):
-                delta, emitted = text[len(emitted):], text
-                if delta:
+        return seq
+
+    def abort(self, seq: Sequence) -> None:
+        """Stop generating for `seq` (e.g. client disconnected); no-op if already finished."""
+        with self._cv:
+            self._aborted.append(seq)
+            self._cv.notify()
+
+    def stream(self, prompt: str, params: SamplingParams, stats: GenStats) -> Iterator[str]:
+        """Blocking generator of text deltas (same shape as the naive Engine)."""
+        seq = self._submit(prompt, params, stats, _Sink())
+        detok = IncrementalDetokenizer(self.tokenizer)
+        try:
+            while (item := seq.out.q.get()) is not None:
+                if isinstance(item, Exception):
+                    raise item
+                if delta := detok.push([item]):
                     yield delta
+        finally:
+            self.abort(seq)
+
+    async def astream(self, prompt: str, params: SamplingParams, stats: GenStats) -> AsyncIterator[str]:
+        """Async generator of text deltas, with no per-request thread. Tokens that arrive while
+        the consumer is busy are coalesced into one delta, so a slow client costs one event per
+        wakeup rather than one per token."""
+        seq = self._submit(prompt, params, stats, _Sink(asyncio.get_running_loop()))
+        q, detok = seq.out.q, IncrementalDetokenizer(self.tokenizer)
+        try:
+            while True:
+                items = [await q.get()]
+                while not q.empty():
+                    items.append(q.get_nowait())
+                ids, done = [], False
+                for it in items:
+                    if it is None:
+                        done = True
+                        break
+                    if isinstance(it, Exception):
+                        raise it
+                    ids.append(it)
+                if ids and (delta := detok.push(ids)):
+                    yield delta
+                if done:
+                    return
+        finally:
+            self.abort(seq)
+
+    # ---- output delivery (scheduler thread) ----
+    def _emit(self, seq: Sequence, item) -> None:
+        self._pending.append((seq.out, item))
+
+    def _flush(self) -> None:
+        pending, self._pending = self._pending, []
+        by_loop: dict = {}
+        for sink, item in pending:
+            if sink.loop is None:
+                sink.q.put(item)
+            else:
+                by_loop.setdefault(sink.loop, []).append((sink.q, item))
+        for loop, batch in by_loop.items():
+            try:
+                loop.call_soon_threadsafe(_deliver, batch)
+            except RuntimeError:      # event loop closed: nobody is listening any more
+                pass
 
     # ---- scheduler ----
     def _blocks_needed(self, seq: Sequence, upto: int) -> int:
@@ -156,7 +234,21 @@ class BatchEngine(Engine):
         self.waiting.appendleft(seq)
         self.preemptions += 1
 
+    def _drop_aborted(self) -> None:
+        for seq in self._aborted:
+            if seq in self.running:
+                self.running.remove(seq)
+            elif seq in self.waiting:
+                self.waiting.remove(seq)
+            else:
+                continue              # already finished
+            self._release(seq)
+            seq.stats.finish_reason = "abort"
+        self._aborted.clear()
+
     def _schedule(self) -> list[tuple[Sequence, int]]:
+        if self._aborted:
+            self._drop_aborted()
         budget = self.max_batched_tokens
         plan: list[tuple[Sequence, int]] = []
         for seq in list(self.running):          # oldest first
@@ -185,7 +277,7 @@ class BatchEngine(Engine):
                 seq.num_computed = 0
                 if not self.running:              # can never fit, even alone
                     self.waiting.popleft()
-                    seq.out.put(RuntimeError("request does not fit in the KV cache"))
+                    self._emit(seq, RuntimeError("request does not fit in the KV cache"))
                     continue
                 break                             # wait for blocks to free up
             self.waiting.popleft()
@@ -204,7 +296,7 @@ class BatchEngine(Engine):
         seq.stats.total_s = time.perf_counter() - seq.t_submit
         self.running.remove(seq)
         self._release(seq)
-        seq.out.put(None)
+        self._emit(seq, None)
 
     def _step(self, plan: list[tuple[Sequence, int]]) -> None:
         if not plan:
@@ -235,7 +327,7 @@ class BatchEngine(Engine):
                 self._finish(seq, "stop")
                 continue
             seq.tokens.append(tok)
-            seq.out.put(tok)
+            self._emit(seq, tok)
             if seq.num_generated >= seq.params.max_tokens or len(seq.tokens) >= self.max_model_len:
                 self._finish(seq, "length")
 
@@ -243,14 +335,16 @@ class BatchEngine(Engine):
         while True:
             try:
                 with self._cv:            # only the queues are shared with request threads
-                    while not self.waiting and not self.running:
+                    while not self.waiting and not self.running and not self._aborted:
                         self._cv.wait()
                     plan = self._schedule()
                 self._step(plan)
+                self._flush()
             except Exception as e:  # fail every in-flight request rather than hang them
                 with self._cv:
                     for seq in self.running + list(self.waiting):
                         self._release(seq)
-                        seq.out.put(e)
+                        self._emit(seq, e)
                     self.running.clear()
                     self.waiting.clear()
+                    self._flush()

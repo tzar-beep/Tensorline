@@ -70,6 +70,39 @@ What the numbers show:
   is host-side work: the Python scheduler, incremental detokenisation and SSE streaming. That is
   the next bottleneck to attack.
 
+### Host-side path: thread-free streaming
+
+With CUDA graphs, the GPU part of a batch-64 step takes about 20 ms, so host-side Python became
+the bottleneck. Profiling at concurrency 64 showed that every token went through two thread
+handoffs: the scheduler woke one of 64 per-request OS threads (`queue.put`), and that thread
+re-decoded its entire output (O(n²) per request) and then woke the event loop. The fix:
+
+- **No per-request threads.** The scheduler buffers each step's tokens and delivers them with
+  **one** `call_soon_threadsafe` per step to the asyncio loop (`BatchEngine.astream`).
+- **Incremental detokenisation** (prefix/read offsets, as in vLLM/TGI): O(1) per token instead
+  of O(n). It is tested against full decoding on SentencePiece and byte-level BPE tokenizers,
+  including emoji, CJK and ligatures.
+- **Adaptive coalescing.** Tokens that queue up while a consumer is busy are sent as one SSE
+  event, and SSE frames are pre-rendered around a `json.dumps` of the delta only.
+- **Cancellation.** A client disconnect aborts the sequence and frees its KV blocks immediately.
+
+Before and after, back to back on the graphs engine ([before](bench/results/host_before.json),
+[after](bench/results/host_after.json)):
+
+| Concurrency | tok/s before → **after** | Latency p50 | Latency p99 |
+|---:|---:|---:|---:|
+| 1  | 80.4 → **79.6**   | 1.52 → 1.53 s | 2.05 → 2.09 s |
+| 16 | 490.4 → **540.7** | 3.00 → 2.72 s | 3.51 → 3.17 s |
+| 32 | 859.5 → **1003.2** | 3.39 → 2.84 s | 4.70 → 4.05 s |
+| 64 | 1211.7 → **1498.0** (+24%) | 5.01 → 3.84 s | 6.38 → 5.29 s |
+
+At concurrency 1 there is nothing to contend with, so there is no change. Tested and rejected:
+shortening Python's GIL switch interval (5 → 0.5 ms) to cut handoff latency gave +1.7%, within
+noise, so it was left out. Where a batch-64 step's time goes now: about 23 ms of graph replay plus
+GPU sync, and about 7 ms of Python scheduling and bookkeeping. The engine alone (no HTTP) does
+2,070 tok/s; HTTP/SSE takes it to 1,498. Default-workload runs from here on show 78–83% of prompt
+tokens cached, because the four benchmark prompts repeat.
+
 ### Automatic prefix caching: shared system prompt
 
 This is a RAG/agent-style workload. Every request carries the same ~1,000-token system prompt
@@ -127,6 +160,11 @@ client ──HTTP/SSE──▶ FastAPI (asyncio) ──▶ request thread ──
   width, and each bucket's graph is captured lazily. All graphs share one memory pool and one
   logits buffer. Inputs go in with a single host-to-device copy, and padding rows write only to
   a reserved scratch KV block. Steps containing prefill run eagerly.
+- **Output path** ([`tensorline/batch_engine.py`](tensorline/batch_engine.py) `astream`,
+  [`tensorline/detok.py`](tensorline/detok.py)): there is no thread per request. Each step's
+  tokens reach the asyncio loop in one batched wakeup and are detokenised incrementally. Tokens
+  that back up are coalesced into one SSE event. A disconnected client's sequence is aborted
+  and its blocks are freed.
 - [`tensorline/engine.py`](tensorline/engine.py): model loading and the Phase 1 one-at-a-time loop,
   kept as `--engine naive` as the baseline.
 - [`tensorline/server.py`](tensorline/server.py): `/v1/chat/completions` (streaming and
@@ -160,6 +198,10 @@ Correctness is checked by **differential testing** against reference implementat
 - prefix caching ([`tests/test_prefix_cache.py`](tests/test_prefix_cache.py)): allocator
   ref-count, LRU and eviction invariants; cache-hit generations token-identical to caching off;
   the fully cached prompt edge case; and preemption combined with sharing, with no leaked blocks;
+- streaming ([`tests/test_streaming.py`](tests/test_streaming.py)): incremental detokenisation
+  equals full decoding, both token by token and coalesced, on two tokenizer families with
+  multi-byte text; the batch engine's async API stream matches non-stream; an abandoned stream
+  is aborted with every KV block returned;
 - API tests: OpenAI response shape, and streamed output identical to non-streamed output.
 
 ## Roadmap
@@ -172,8 +214,9 @@ Each phase ships finished and demoable, with benchmark numbers, before the next 
    (16-token blocks, a block table per sequence, free-list allocator), chunked prefill, and
    recompute preemption, and CUDA-graph decode (5.9× single-stream, 80× peak throughput vs naive).
    Automatic prefix caching gives +54% throughput and 5× lower p99 TTFT on a shared-system-prompt workload.
-   - *Next:* cutting host-side overhead (detokenisation and streaming off the scheduler's critical
-     path), which caps end-to-end throughput at about 40% of the measured decode ceiling.
+   A thread-free streaming path adds +24% at concurrency 64 (1,498 tok/s).
+   - *Next:* overlap CPU scheduling with GPU execution: prepare step t+1's inputs while step t's
+     graph runs, which hides the remaining ~7 ms of Python per step.
 3. **Quantisation + multi-model**: int8 and 4-bit weights (bitsandbytes first, then a hand-written
    int8 matmul for comparison), loading and unloading several models under a VRAM budget with LRU
    eviction, and quality checks (perplexity delta) for each quantisation mode.
