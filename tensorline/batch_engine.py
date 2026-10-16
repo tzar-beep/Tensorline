@@ -24,7 +24,7 @@ from typing import Iterator
 import torch
 
 from .engine import Engine, GenStats, SamplingParams, sample
-from .paged import BlockAllocator, PagedModel, SeqChunk
+from .paged import BlockAllocator, PagedModel, SeqChunk, block_hash
 
 
 @dataclass(eq=False)
@@ -39,6 +39,7 @@ class Sequence:
     t_submit: float
     blocks: list[int] = field(default_factory=list)
     num_computed: int = 0      # tokens whose K/V is in the cache
+    hashes: list[int] = field(default_factory=list)   # content hashes of its full, computed blocks
 
     @property
     def num_generated(self) -> int:
@@ -50,7 +51,7 @@ class BatchEngine(Engine):
                  block_size: int = 16, num_blocks: int | None = None,
                  kv_mem_fraction: float = 0.6, max_num_seqs: int = 64,
                  max_batched_tokens: int = 2048, max_model_len: int = 4096,
-                 cuda_graphs: bool = True):
+                 cuda_graphs: bool = True, prefix_caching: bool = True):
         super().__init__(model_id, device, dtype)
         if num_blocks is None:
             per_block = PagedModel.bytes_per_block(self.model, block_size)
@@ -60,7 +61,7 @@ class BatchEngine(Engine):
             else:
                 num_blocks = (512 << 20) // per_block   # 512 MiB on CPU
         self.paged = PagedModel(self.model, num_blocks, block_size)
-        self.alloc = BlockAllocator(num_blocks)
+        self.alloc = BlockAllocator(num_blocks, prefix_caching)
         self.graphs = None
         if cuda_graphs and self.device == "cuda":
             from .cuda_graphs import CudaGraphDecoder
@@ -77,6 +78,8 @@ class BatchEngine(Engine):
         self.steps = 0
         self.preemptions = 0
         self.max_running_seen = 0
+        self.prompt_tokens_total = 0
+        self.prefix_hit_tokens = 0
         threading.Thread(target=self._loop, daemon=True, name="tl-scheduler").start()
 
     # ---- public API (same shape as the naive Engine) ----
@@ -119,6 +122,31 @@ class BatchEngine(Engine):
     def _release(self, seq: Sequence) -> None:
         self.alloc.free(seq.blocks)
         seq.blocks = []
+        seq.hashes = []
+
+    def _match_prefix(self, seq: Sequence) -> None:
+        """Point a fresh sequence at cached blocks for the longest already-computed prefix."""
+        bs, parent = self.block_size, None
+        for i in range(len(seq.tokens) // bs):
+            h = block_hash(parent, seq.tokens[i * bs:(i + 1) * bs])
+            blk = self.alloc.lookup(h)
+            if blk is None:
+                break
+            seq.blocks.append(blk)
+            seq.hashes.append(h)
+            parent = h
+        if len(seq.blocks) * bs == len(seq.tokens):   # fully cached: still need logits for the
+            self.alloc.free([seq.blocks.pop()])        # last token, so recompute the last block
+            seq.hashes.pop()
+        seq.num_computed = len(seq.blocks) * bs
+
+    def _publish_full_blocks(self, seq: Sequence) -> None:
+        bs = self.block_size
+        while len(seq.hashes) < seq.num_computed // bs:
+            i = len(seq.hashes)
+            h = block_hash(seq.hashes[-1] if i else None, seq.tokens[i * bs:(i + 1) * bs])
+            seq.hashes.append(h)
+            self.alloc.register(seq.blocks[i], h)
 
     def _preempt(self, seq: Sequence) -> None:
         """Recompute-style preemption: drop the KV cache, requeue at the front."""
@@ -149,8 +177,12 @@ class BatchEngine(Engine):
                 budget -= n
         while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
+            if self.alloc.prefix_caching and not seq.blocks:
+                self._match_prefix(seq)
             n = min(len(seq.tokens) - seq.num_computed, budget)
             if not self._grow(seq, seq.num_computed + n):
+                self._release(seq)                # drop any prefix refs while it waits
+                seq.num_computed = 0
                 if not self.running:              # can never fit, even alone
                     self.waiting.popleft()
                     seq.out.put(RuntimeError("request does not fit in the KV cache"))
@@ -158,6 +190,10 @@ class BatchEngine(Engine):
                 break                             # wait for blocks to free up
             self.waiting.popleft()
             self.running.append(seq)
+            if seq.num_generated == 0:            # first admission (not a preemption re-admit)
+                seq.stats.cached_tokens = seq.num_computed
+                self.prompt_tokens_total += seq.prompt_len
+                self.prefix_hit_tokens += seq.num_computed
             plan.append((seq, n))
             budget -= n
         return plan
@@ -189,6 +225,7 @@ class BatchEngine(Engine):
         greedy = logits.argmax(dim=-1).tolist() if sampled else []
         for (seq, n) in plan:
             seq.num_computed += n
+            self._publish_full_blocks(seq)
         now = time.perf_counter()
         for i, seq in enumerate(sampled):
             tok = greedy[i] if seq.params.temperature <= 0 else sample(logits[i], seq.params)

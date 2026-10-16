@@ -69,6 +69,7 @@ def create_app(engine: Engine) -> FastAPI:
             "prompt_tokens": s.prompt_tokens,
             "completion_tokens": s.completion_tokens,
             "total_tokens": s.prompt_tokens + s.completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": s.cached_tokens},
         }
 
     @app.post("/v1/chat/completions")
@@ -123,6 +124,7 @@ def main():
     ap.add_argument("--max-batched-tokens", type=int, default=2048)
     ap.add_argument("--num-blocks", type=int, default=None, help="KV blocks (default: fit 60%% of free VRAM)")
     ap.add_argument("--no-cuda-graphs", action="store_true", help="run decode steps eagerly")
+    ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse KV blocks across requests")
     a = ap.parse_args()
     if a.engine == "naive":
         engine = Engine(a.model, a.device, a.dtype)
@@ -130,7 +132,8 @@ def main():
         from .batch_engine import BatchEngine
         engine = BatchEngine(a.model, a.device, a.dtype, num_blocks=a.num_blocks,
                              max_num_seqs=a.max_num_seqs, max_batched_tokens=a.max_batched_tokens,
-                             cuda_graphs=not a.no_cuda_graphs)
+                             cuda_graphs=not a.no_cuda_graphs,
+                             prefix_caching=not a.no_prefix_caching)
     uvicorn.run(create_app(engine), host=a.host, port=a.port)
 
 

@@ -33,6 +33,7 @@ class SamplingParams:
 class GenStats:
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached_tokens: int = 0      # prompt tokens served from the prefix cache
     ttft_s: float = 0.0
     total_s: float = 0.0
     finish_reason: str = "length"

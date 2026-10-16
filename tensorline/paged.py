@@ -15,7 +15,7 @@ the attention, KV cache and batching are this file's.
 """
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -23,21 +23,75 @@ import torch.nn.functional as F
 
 
 class BlockAllocator:
-    def __init__(self, num_blocks: int):
+    """Ref-counted KV block allocator with automatic prefix caching.
+
+    A *full* block is identified by a content hash chained over everything before it,
+    hash(parent_hash, its 16 token ids), so equal hashes mean equal K/V contents. Freed blocks
+    keep their contents and hash and sit in an LRU free list: a later request with the same
+    prefix takes them back (`lookup`) instead of recomputing them, and they are evicted only
+    when `allocate` needs the memory. Blocks shared by several sequences are only ever *read*:
+    a sequence writes K/V only at positions past its fully computed (and therefore hashed)
+    prefix.
+    """
+
+    def __init__(self, num_blocks: int, prefix_caching: bool = True):
         self.num_blocks = num_blocks
-        self._free = deque(range(num_blocks))
+        self.prefix_caching = prefix_caching
+        self._free: OrderedDict[int, None] = OrderedDict.fromkeys(range(num_blocks))  # LRU first
+        self._ref = [0] * num_blocks
+        self._hash_of: list[int | None] = [None] * num_blocks
+        self._cached: dict[int, int] = {}            # content hash -> block id
 
     @property
     def num_free(self) -> int:
+        """Blocks with no owner, including evictable cached ones."""
         return len(self._free)
+
+    @property
+    def num_cached(self) -> int:
+        return len(self._cached)
 
     def allocate(self, n: int) -> list[int] | None:
         if n > len(self._free):
             return None
-        return [self._free.popleft() for _ in range(n)]
+        out = []
+        for _ in range(n):
+            blk, _ = self._free.popitem(last=False)  # least recently freed
+            h = self._hash_of[blk]
+            if h is not None:                        # evict its cached contents
+                del self._cached[h]
+                self._hash_of[blk] = None
+            self._ref[blk] = 1
+            out.append(blk)
+        return out
 
     def free(self, blocks: list[int]) -> None:
-        self._free.extend(blocks)
+        # Tail blocks are the least shareable, so they go to the front of the LRU (evicted first).
+        for blk in reversed(blocks):
+            self._ref[blk] -= 1
+            assert self._ref[blk] >= 0, f"double free of block {blk}"
+            if self._ref[blk] == 0:
+                self._free[blk] = None
+
+    def lookup(self, h: int) -> int | None:
+        """Take a reference on the cached block with content hash `h`, if any."""
+        blk = self._cached.get(h) if self.prefix_caching else None
+        if blk is None:
+            return None
+        if self._ref[blk] == 0:
+            del self._free[blk]
+        self._ref[blk] += 1
+        return blk
+
+    def register(self, blk: int, h: int) -> None:
+        """Publish a fully computed block under its content hash."""
+        if self.prefix_caching and h not in self._cached:
+            self._cached[h] = blk
+            self._hash_of[blk] = h
+
+
+def block_hash(parent: int | None, tokens) -> int:
+    return hash((parent, tuple(tokens)))
 
 
 @dataclass

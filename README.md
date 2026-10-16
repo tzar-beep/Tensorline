@@ -5,7 +5,7 @@ models behind an OpenAI-compatible API, and is built up phase by phase toward co
 a paged KV cache, quantisation and multi-model serving, with every claim backed by a reproducible
 benchmark.
 
-> Status: **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, and CUDA-graph decode.
+> Status: **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, CUDA-graph decode and automatic prefix caching.
 
 ## Quickstart
 
@@ -70,6 +70,26 @@ What the numbers show:
   is host-side work: the Python scheduler, incremental detokenisation and SSE streaming. That is
   the next bottleneck to attack.
 
+### Automatic prefix caching: shared system prompt
+
+This is a RAG/agent-style workload. Every request carries the same ~1,000-token system prompt
+plus a unique question (1,032 prompt tokens on average, 128 output tokens). The graphs engine is
+run back to back with caching off vs on (`RUNS="prefix-off prefix-on" bash bench/run_compare.sh`;
+[off](bench/results/prefix_off.json), [on](bench/results/prefix_on.json)).
+
+| Concurrency | Prompt tokens from cache | tok/s off → **on** | TTFT p99 off → **on** | Latency p99 off → **on** |
+|---:|---:|---:|---:|---:|
+| 1  | 92% | 59.8 → **62.1**  | 153 ms → **136 ms** | 2.17 s → **2.10 s** |
+| 4  | 99% | 139.2 → **160.3** | 513 ms → **229 ms** | 3.68 s → **3.10 s** |
+| 16 | 98% | 266.5 → **360.1** | 2.00 s → **514 ms** | 7.80 s → **4.88 s** |
+| 32 | 98% | 331.5 → **510.0** | 4.56 s → **908 ms** | 13.76 s → **7.26 s** |
+
+With the prefix cached, about 1,000 tokens of prefill per request disappear. At concurrency 32
+this gives **+54% throughput, 5× lower p99 TTFT and 1.9× lower p99 latency**. The gain grows with
+load, because uncached prefills compete with everyone's decode steps. Not every number improved:
+p50 TTFT at concurrency 16 got worse (358 → 482 ms) even though p99 fell 4×. The first wave of
+simultaneous arrivals is admitted before any block has been published, so it gets no hits.
+
 > Methodology note: laptop GPU clocks and power state vary between sessions (an earlier standalone
 > run measured naive single-stream at 18.9 tok/s). Comparisons are therefore only made between
 > runs taken back to back, never across sessions.
@@ -112,6 +132,17 @@ client ──HTTP/SSE──▶ FastAPI (asyncio) ──▶ request thread ──
 - [`tensorline/server.py`](tensorline/server.py): `/v1/chat/completions` (streaming and
   non-streaming), `/v1/models`, `/health`.
 
+- **Prefix caching** ([`tensorline/paged.py`](tensorline/paged.py) `BlockAllocator`): each full
+  block is addressed by a chained content hash, `hash(parent_hash, its 16 token ids)`. Equal hashes
+  therefore mean equal K/V. A new request walks its prompt block by block and takes references on
+  the cached blocks it matches, so prefill starts after the shared prefix. Blocks are
+  ref-counted. When freed they keep their contents in an LRU free list, and they are evicted only
+  when memory is needed. The same mechanism makes recompute preemption cheap: a preempted
+  sequence usually finds its own blocks still cached. Shared blocks are never written, because a
+  sequence writes K/V only past its fully computed prefix. A fully cached prompt recomputes its
+  last block to obtain logits. Responses report `usage.prompt_tokens_details.cached_tokens`,
+  matching the OpenAI API.
+
 ### Testing
 
 Correctness is checked by **differential testing** against reference implementations
@@ -126,6 +157,9 @@ Correctness is checked by **differential testing** against reference implementat
   batch (logits and argmax match). A bystander KV block is checked to stay untouched by padding
   rows, and the engine generates identical text with graphs on and off
   ([`tests/test_cuda_graphs.py`](tests/test_cuda_graphs.py));
+- prefix caching ([`tests/test_prefix_cache.py`](tests/test_prefix_cache.py)): allocator
+  ref-count, LRU and eviction invariants; cache-hit generations token-identical to caching off;
+  the fully cached prompt edge case; and preemption combined with sharing, with no leaked blocks;
 - API tests: OpenAI response shape, and streamed output identical to non-streamed output.
 
 ## Roadmap
@@ -137,8 +171,9 @@ Each phase ships finished and demoable, with benchmark numbers, before the next 
 2. **Continuous batching + KV-cache management** ✅: an iteration-level scheduler, a paged KV cache
    (16-token blocks, a block table per sequence, free-list allocator), chunked prefill, and
    recompute preemption, and CUDA-graph decode (5.9× single-stream, 80× peak throughput vs naive).
-   - *Next:* automatic prefix caching (hash-addressed KV blocks shared across requests), then
-     cutting host-side overhead (detokenisation and streaming off the scheduler's critical path).
+   Automatic prefix caching gives +54% throughput and 5× lower p99 TTFT on a shared-system-prompt workload.
+   - *Next:* cutting host-side overhead (detokenisation and streaming off the scheduler's critical
+     path), which caps end-to-end throughput at about 40% of the measured decode ceiling.
 3. **Quantisation + multi-model**: int8 and 4-bit weights (bitsandbytes first, then a hand-written
    int8 matmul for comparison), loading and unloading several models under a VRAM budget with LRU
    eviction, and quality checks (perplexity delta) for each quantisation mode.
