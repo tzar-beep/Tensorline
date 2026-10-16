@@ -52,16 +52,24 @@ def sample(logits: torch.Tensor, p: SamplingParams) -> int:
 
 
 class Engine:
-    def __init__(self, model_id: str, device: str = "auto", dtype: str = "auto"):
+    def __init__(self, model_id: str, device: str = "auto", dtype: str = "auto", quant: str | None = None):
         self.model_id = model_id
         self.device = pick_device(device)
+        self.quant = None if quant in (None, "none", "fp16") else quant
         if dtype == "auto":
             torch_dtype = torch.float16 if self.device == "cuda" else torch.float32
         else:
             torch_dtype = getattr(torch, dtype)
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # Load on CPU first: a quantised model is converted layer by layer on the target device,
+        # so its fp16 weights never have to fit in VRAM all at once.
         self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch_dtype)
+        if self.quant:
+            from .quant import quantize_model
+            quantize_model(self.model, self.quant, self.device, torch_dtype)
         self.model.to(self.device).eval()
+        from .quant import weight_bytes
+        self.weight_bytes = weight_bytes(self.model)
         # Phase 1 serves strictly one request at a time; this lock is the
         # "naive serving" baseline Phase 2's continuous batching is measured against.
         self._lock = threading.Lock()

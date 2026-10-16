@@ -1,0 +1,35 @@
+{
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "window": 1024,
+  "dataset": "wikitext-2-raw-v1/test",
+  "results": [
+    {
+      "quant": "none",
+      "ppl": 10.69884185130549,
+      "weights_gb": 2.875392436981201,
+      "tokens": 298938,
+      "seconds": 130.07091340000625
+    },
+    {
+      "quant": "int8",
+      "ppl": 10.728976545210209,
+      "weights_gb": 1.656379222869873,
+      "tokens": 298938,
+      "seconds": 153.94971200000145
+    },
+    {
+      "quant": "int4",
+      "ppl": 11.451499638278678,
+      "weights_gb": 1.2563300132751465,
+      "tokens": 298938,
+      "seconds": 167.07183039999654
+    },
+    {
+      "quant": "int4-all",
+      "ppl": 12.091945945034803,
+      "weights_gb": 1.0832018852233887,
+      "tokens": 298938,
+      "seconds": 173.23820610000257
+    }
+  ]
+}

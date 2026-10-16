@@ -1,0 +1,57 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "window": 1024,
+  "dataset": "wikitext-2-raw-v1/test",
+  "results": [
+    {
+      "quant": "none",
+      "ppl": 15.949173480781221,
+      "weights_gb": 0.9202079772949219,
+      "tokens": 298938,
+      "seconds": 79.52909440000076
+    },
+    {
+      "quant": "int8",
+      "ppl": 15.931754472990452,
+      "weights_gb": 0.5875225067138672,
+      "tokens": 298938,
+      "seconds": 84.87178310000309
+    },
+    {
+      "quant": "int4-all",
+      "ppl": 19.57962503461249,
+      "weights_gb": 0.4307441711425781,
+      "tokens": 298938,
+      "seconds": 95.7363777999999
+    },
+    {
+      "quant": "int4",
+      "ppl": 17.413,
+      "weights_gb": 0.478,
+      "tokens": 298938,
+      "note": "v_proj+down_proj int8, rest int4 g128"
+    }
+  ],
+  "ablation": [
+    {
+      "quant": "int4-all g64",
+      "ppl": 19.146,
+      "weights_gb": 0.441
+    },
+    {
+      "quant": "int4-all g32",
+      "ppl": 17.794,
+      "weights_gb": 0.462
+    },
+    {
+      "quant": "int4 down_proj-only int8",
+      "ppl": 18.287,
+      "weights_gb": 0.476
+    },
+    {
+      "quant": "int4 v+down int8 g64",
+      "ppl": 17.356,
+      "weights_gb": 0.485
+    }
+  ]
+}

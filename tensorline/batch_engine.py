@@ -73,11 +73,16 @@ class BatchEngine(Engine):
                  block_size: int = 16, num_blocks: int | None = None,
                  kv_mem_fraction: float = 0.6, max_num_seqs: int = 64,
                  max_batched_tokens: int = 2048, max_model_len: int = 4096,
-                 cuda_graphs: bool = True, prefix_caching: bool = True):
-        super().__init__(model_id, device, dtype)
+                 cuda_graphs: bool = True, prefix_caching: bool = True,
+                 quant: str | None = None, kv_cache_gb: float | None = None):
+        super().__init__(model_id, device, dtype, quant)
+        if self.quant and self.device == "cuda":
+            self._warm_quant_kernels(max_num_seqs)
         if num_blocks is None:
             per_block = PagedModel.bytes_per_block(self.model, block_size)
-            if self.device == "cuda":
+            if kv_cache_gb is not None:
+                num_blocks = int(kv_cache_gb * (1 << 30)) // per_block
+            elif self.device == "cuda":
                 free, _ = torch.cuda.mem_get_info()
                 num_blocks = int(free * kv_mem_fraction) // per_block
             else:
@@ -104,7 +109,35 @@ class BatchEngine(Engine):
         self.prefix_hit_tokens = 0
         self._pending: list[tuple[_Sink, object]] = []   # outputs produced during this step
         self._aborted: list[Sequence] = []
-        threading.Thread(target=self._loop, daemon=True, name="tl-scheduler").start()
+        self._stop = False
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="tl-scheduler")
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        """Stop the scheduler, fail anything still queued, and drop every GPU tensor this engine
+        owns (weights, KV cache, CUDA graphs) so the memory can be reclaimed."""
+        with self._cv:
+            self._stop = True
+            self._cv.notify()
+        self._thread.join()
+        err = RuntimeError("model unloaded")
+        for seq in self.running + list(self.waiting):
+            self._emit(seq, err)
+        self.running.clear()
+        self.waiting.clear()
+        self._flush()
+        self.graphs = self.paged = self.model = None
+
+    def _warm_quant_kernels(self, max_batch: int) -> None:
+        """Run every quantised layer once per row-tile size so Triton autotuning happens now,
+        not on the first live requests (or inside a CUDA-graph capture)."""
+        from .quant import QuantLinear
+        layers = [m for m in self.model.modules() if isinstance(m, QuantLinear)]
+        with torch.inference_mode():
+            for M in sorted({1, min(32, max_batch), min(64, max_batch)}):
+                for m in layers:
+                    m(torch.zeros(M, m.in_features, device=self.device, dtype=m.dtype))
+        torch.cuda.synchronize()
 
     # ---- public API ----
     def _submit(self, prompt: str, params: SamplingParams, stats: GenStats, sink: _Sink) -> Sequence:
@@ -332,11 +365,13 @@ class BatchEngine(Engine):
                 self._finish(seq, "length")
 
     def _loop(self) -> None:
-        while True:
+        while not self._stop:
             try:
                 with self._cv:            # only the queues are shared with request threads
-                    while not self.waiting and not self.running and not self._aborted:
+                    while not self.waiting and not self.running and not self._aborted and not self._stop:
                         self._cv.wait()
+                    if self._stop:
+                        return
                     plan = self._schedule()
                 self._step(plan)
                 self._flush()

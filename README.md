@@ -5,7 +5,7 @@ models behind an OpenAI-compatible API, and is built up phase by phase toward co
 a paged KV cache, quantisation and multi-model serving, with every claim backed by a reproducible
 benchmark.
 
-> Status: **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, CUDA-graph decode and automatic prefix caching.
+> Status: **Phase 3 in progress** (quantisation + multi-model done; 3B results pending). **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, CUDA-graph decode and automatic prefix caching.
 
 ## Quickstart
 
@@ -102,6 +102,54 @@ noise, so it was left out. Where a batch-64 step's time goes now: about 23 ms of
 GPU sync, and about 7 ms of Python scheduling and bookkeeping. The engine alone (no HTTP) does
 2,070 tok/s; HTTP/SSE takes it to 1,498. Default-workload runs from here on show 78–83% of prompt
 tokens cached, because the four benchmark prompts repeat.
+
+### Quantisation (Phase 3)
+
+Weight-only W8A16 / W4A16 with hand-written fused Triton kernels ([`tensorline/kernels.py`](tensorline/kernels.py)):
+dequantisation is folded algebraically, small-M tiles stream each weight byte once, and split-K
+with a deterministic reduction keeps the GPU busy. `int4` is mixed precision: `v_proj` and
+`down_proj` stay int8, in the spirit of llama.cpp's Q4_K_M.
+
+**Quality**: WikiText-2 perplexity (full test set, 299k tokens, 1024-token windows; [`bench/perplexity.py`](bench/perplexity.py))
+
+| Model | fp16 | int8 | int4 (mixed) | int4-all | Weights fp16 → int8 → int4 |
+|---|---:|---:|---:|---:|---|
+| Qwen2.5-0.5B | 15.949 | 15.932 (−0.1%) | 17.413 (+9.2%) | 19.580 (+22.8%) | 0.92 → 0.59 → 0.48 GB |
+| Qwen2.5-1.5B | 10.699 | 10.729 (+0.3%) | 11.451 (+7.0%) | 12.092 (+13.0%) | 2.88 → 1.66 → 1.26 GB |
+
+The int4 ablation on 0.5B: group size 64 gives 19.15, group 32 gives 17.79, and keeping only
+`down_proj` in int8 gives 18.29. Keeping both `v_proj` and `down_proj` in int8 (17.41) wins and
+keeps the fast 128-wide kernel.
+
+**Kernel speed** (GPU time inside a CUDA graph, vs fp16 cuBLAS): at decode sizes (M ≤ 16), int8
+is **1.4–1.8×** and int4 **1.5–2.2×** faster across the 0.5B–3B layer shapes. At M = 64, int8
+is 1.2–1.5× faster, but int4 is **slower (0.74–0.82×)**. Its tile becomes compute-bound, which is
+a known limitation and next on the list.
+
+**Serving** (output tok/s through the server, back to back; `TAG=... RUNS="q-none q-int8 q-int4" bash bench/run_compare.sh <model>`)
+
+| Model | Concurrency | fp16 | int8 | int4 |
+|---|---:|---:|---:|---:|
+| 0.5B | 1  | 92.8  | **108.7** | 104.3 |
+| 0.5B | 64 | **1628.6** | 1564.0 | 1362.4 |
+| 1.5B | 1  | 41.9  | 52.1 | **54.4** (+30%) |
+| 1.5B | 16 | 321.4 | **352.1** | 321.5 |
+| 1.5B | 64 | 857.7 | **987.5** (+15%) | 766.5 |
+
+Quantisation pays off for single streams and larger models, where weight streaming dominates.
+At 0.5B, the fp16 embedding/LM head (272 MB) is a large share of the bytes, so the gains are
+small. int4 at high concurrency is held back by the M = 64 kernel limitation above.
+
+### Multi-model serving (Phase 3)
+
+`tensorline --serve small=Qwen/Qwen2.5-0.5B-Instruct --serve big=Qwen/Qwen2.5-1.5B-Instruct:int4 --gpu-budget-gb 5`
+serves several models from one GPU ([`tensorline/manager.py`](tensorline/manager.py)). A request's
+`model` field picks the model, and models load on first use. A footprint estimate from the config
+(per-layer bytes for the quant mode, plus KV cache) is checked against the budget, and the least
+recently used *idle* model is evicted when the budget would be exceeded. Busy models are never
+evicted; a load waits for one to go idle, then times out with a 503. Unloading stops the
+scheduler and frees weights, KV cache and CUDA graphs. Admin: `GET /admin/models`,
+`POST /admin/models/{name}/load|unload`.
 
 ### Automatic prefix caching: shared system prompt
 
@@ -202,6 +250,13 @@ Correctness is checked by **differential testing** against reference implementat
   equals full decoding, both token by token and coalesced, on two tokenizer families with
   multi-byte text; the batch engine's async API stream matches non-stream; an abandoned stream
   is aborted with every KV block returned;
+- quantisation ([`tests/test_quant.py`](tests/test_quant.py)): round-trip error bounds and
+  packing layout; fused kernels vs the dequantise reference over 30 shape/M combinations; kernels
+  inside CUDA graphs; quantised paged forward vs HF forward; quantised engine graphs vs eager;
+- multi-model ([`tests/test_manager.py`](tests/test_manager.py)): LRU eviction order, busy models
+  never evicted, a single load under concurrent requests, over-budget rejection, HTTP
+  routing/admin; on GPU, load/unload cycles return VRAM to baseline and the estimate matches the
+  measured footprint within 15%;
 - API tests: OpenAI response shape, and streamed output identical to non-streamed output.
 
 ## Roadmap
