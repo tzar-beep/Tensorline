@@ -5,7 +5,7 @@ models behind an OpenAI-compatible API, and is built up phase by phase toward co
 a paged KV cache, quantisation and multi-model serving, with every claim backed by a reproducible
 benchmark.
 
-> Status: **Phase 2 complete**: continuous batching over a paged KV cache, with chunked prefill and preemption.
+> Status: **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, and CUDA-graph decode.
 
 ## Quickstart
 
@@ -30,38 +30,49 @@ Reference hardware: **NVIDIA RTX 3050 Laptop (6 GB VRAM)**, 16 GB RAM, Windows 1
 Model: Qwen2.5-0.5B-Instruct, fp16, greedy, 128 max output tokens. Harness: [`bench/bench.py`](bench/bench.py)
 (streaming clients, works against any OpenAI-compatible server). Raw results live in `bench/results/`.
 
-### Phase 2 vs Phase 1: continuous batching against naive serving
+### Naive vs continuous batching vs batching + CUDA graphs
 
-Both engines were run back to back by [`bench/run_compare.sh`](bench/run_compare.sh) in the same
-machine state. Each level sends max(16, 2 × concurrency) requests, each with 128 output tokens
-([naive JSON](bench/results/phase1_naive.json), [batch JSON](bench/results/phase2_batch.json)).
+All three engines were run back to back by [`bench/run_compare.sh`](bench/run_compare.sh) in the
+same machine state. Each level sends max(16, 2 × concurrency) streaming requests with 128 output
+tokens each ([naive](bench/results/naive.json), [eager](bench/results/eager.json),
+[graphs](bench/results/graphs.json)).
 
-| Concurrency | Naive tok/s | **Batched tok/s** | Speed-up | Naive TTFT p50 | **Batched TTFT p50** | Batched TTFT p99 | Batched latency p99 |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1  | 13.2 | **16.0**  | 1.2× | 92 ms   | **72 ms**  | 95 ms   | 8.79 s  |
-| 4  | 14.3 | **54.9**  | 3.8× | 20.6 s  | **154 ms** | 219 ms  | 9.05 s  |
-| 8  | 13.5 | **88.8**  | 6.6× | 50.3 s  | **188 ms** | 270 ms  | 9.14 s  |
-| 16 | 13.3 | **169.6** | 12.8× | 110.1 s | **310 ms** | 482 ms  | 9.44 s  |
-| 32 | —    | **321.1** | —    | —       | **481 ms** | 863 ms  | 10.41 s |
-| 64 | —    | **558.3** | 39× vs naive peak | — | **874 ms** | 1.47 s | 12.55 s |
+**Throughput (output tok/s)**
+
+| Concurrency | Naive (Phase 1) | Batched, eager | **Batched + CUDA graphs** | vs naive |
+|---:|---:|---:|---:|---:|
+| 1  | 13.7 | 18.4  | **80.5**   | 5.9× |
+| 4  | 14.8 | 52.9  | **211.8**  | 14× |
+| 8  | 15.0 | 90.5  | **335.7**  | 22× |
+| 16 | 15.8 | 174.1 | **558.1**  | 35× |
+| 32 | —    | 317.6 | **866.4**  | — |
+| 64 | —    | 557.5 | **1258.8** | 80× vs naive peak |
+
+**Latency (graphs engine; naive in brackets)**
+
+| Concurrency | TTFT p50 | TTFT p99 | Request latency p50 | Request latency p99 |
+|---:|---:|---:|---:|---:|
+| 1  | 77 ms (89 ms)   | 94 ms   | 1.51 s (9.16 s)  | 2.08 s |
+| 8  | 132 ms (43.9 s) | 221 ms  | 2.20 s (54.1 s)  | 2.92 s |
+| 16 | 299 ms (92.3 s) | 378 ms  | 2.72 s (100.3 s) | 3.61 s |
+| 64 | 770 ms          | 1.36 s  | 4.77 s           | 6.56 s |
 
 What the numbers show:
-- **Throughput scales almost linearly with load**, from 16 to 558 tok/s, while per-request speed
-  only drops from 16.2 to 10.1 tok/s. One forward pass over 64 sequences costs barely more than
-  one over a single sequence.
-- **Queueing disappears from TTFT.** Naive serving makes request N wait for N−1 full generations
-  (110 s at concurrency 16). With iteration-level scheduling, new requests join on the next step:
-  p99 TTFT stays under 1.5 s even at concurrency 64.
-- **Single-stream speed also improved** (16.0 vs 13.2 tok/s). The paged decode step uses fused
-  SDPA with a grouped-query layout and avoids HF's cache bookkeeping. Measured in-process, a
-  decode step takes 64.9 ms for Tensorline vs 74.4 ms for HF.
-- **Where the time goes:** a decode step costs roughly the same at batch 1 and batch 64. At
-  0.5B parameters the step is bound by CPU dispatch of a few hundred small kernels, not GPU
-  FLOPs. That is why batching pays off so well, and why CUDA graphs come next.
+- **Continuous batching** makes throughput scale with load (18 → 558 tok/s eager), where naive
+  stays flat at about 15 tok/s. It also removes queueing from TTFT: naive request N waits for
+  N−1 whole generations (92 s at concurrency 16), while batched requests join on the next step.
+- **CUDA graphs** fix what batching cannot: per-step overhead. Measured in-process, a decode
+  step drops from **69 → 11 ms at batch 1 (6.3×)** and from **64 → 20 ms at batch 64 (3.2×)**.
+  At 0.5B parameters, the eager step is a few hundred small kernels, each dispatched from
+  Python. Replaying the captured graph is a single launch.
+- **Where the time goes now:** the in-process decode ceiling at batch 64 is about 3,200 tok/s
+  (64 tokens / 20 ms). End to end, the server reaches 1,259 tok/s, about 40% of that. The rest
+  is host-side work: the Python scheduler, incremental detokenisation and SSE streaming. That is
+  the next bottleneck to attack.
 
-> Methodology note: laptop GPU clocks and power state vary between sessions. An earlier
-> standalone run measured naive single-stream at 18.9 tok/s. Comparisons are therefore only made
-> between runs taken back to back, never across sessions.
+> Methodology note: laptop GPU clocks and power state vary between sessions (an earlier standalone
+> run measured naive single-stream at 18.9 tok/s). Comparisons are therefore only made between
+> runs taken back to back, never across sessions.
 
 ## Architecture
 
@@ -91,6 +102,11 @@ client ──HTTP/SSE──▶ FastAPI (asyncio) ──▶ request thread ──
   are **chunked** across steps, so a long prefill never stalls everyone's decode. When blocks run
   out, the newest sequence is **preempted**: its blocks are freed and it is recomputed later, and
   its stream continues seamlessly.
+- [`tensorline/cuda_graphs.py`](tensorline/cuda_graphs.py): CUDA-graph capture and replay of
+  pure-decode steps. Batches are padded to power-of-two buckets for batch size and block-table
+  width, and each bucket's graph is captured lazily. All graphs share one memory pool and one
+  logits buffer. Inputs go in with a single host-to-device copy, and padding rows write only to
+  a reserved scratch KV block. Steps containing prefill run eagerly.
 - [`tensorline/engine.py`](tensorline/engine.py): model loading and the Phase 1 one-at-a-time loop,
   kept as `--engine naive` as the baseline.
 - [`tensorline/server.py`](tensorline/server.py): `/v1/chat/completions` (streaming and
@@ -106,6 +122,10 @@ Correctness is checked by **differential testing** against reference implementat
   in four regimes: plain, forced chunked prefill (4-token budget), forced preemption (12 KV
   blocks), and a 2-sequence cap. Each run also asserts that no KV blocks leak;
 - a request too large for the whole KV cache fails cleanly instead of hanging the scheduler;
+- CUDA-graph decode vs eager decode, run for 20 steps across a block boundary with a padded
+  batch (logits and argmax match). A bystander KV block is checked to stay untouched by padding
+  rows, and the engine generates identical text with graphs on and off
+  ([`tests/test_cuda_graphs.py`](tests/test_cuda_graphs.py));
 - API tests: OpenAI response shape, and streamed output identical to non-streamed output.
 
 ## Roadmap
@@ -116,11 +136,9 @@ Each phase ships finished and demoable, with benchmark numbers, before the next 
    `/v1/chat/completions`.
 2. **Continuous batching + KV-cache management** ✅: an iteration-level scheduler, a paged KV cache
    (16-token blocks, a block table per sequence, free-list allocator), chunked prefill, and
-   recompute preemption.
-   - *Next:* CUDA-graph capture of the decode step. Step time is dominated by per-kernel launch
-     overhead (see the benchmarks), so replaying a captured graph per batch-size bucket is the
-     biggest remaining single-stream win. Prefix caching (sharing blocks across a common system
-     prompt) is also planned.
+   recompute preemption, and CUDA-graph decode (5.9× single-stream, 80× peak throughput vs naive).
+   - *Next:* automatic prefix caching (hash-addressed KV blocks shared across requests), then
+     cutting host-side overhead (detokenisation and streaming off the scheduler's critical path).
 3. **Quantisation + multi-model**: int8 and 4-bit weights (bitsandbytes first, then a hand-written
    int8 matmul for comparison), loading and unloading several models under a VRAM budget with LRU
    eviction, and quality checks (perplexity delta) for each quantisation mode.

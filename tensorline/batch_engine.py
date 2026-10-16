@@ -49,7 +49,8 @@ class BatchEngine(Engine):
     def __init__(self, model_id: str, device: str = "auto", dtype: str = "auto", *,
                  block_size: int = 16, num_blocks: int | None = None,
                  kv_mem_fraction: float = 0.6, max_num_seqs: int = 64,
-                 max_batched_tokens: int = 2048, max_model_len: int = 4096):
+                 max_batched_tokens: int = 2048, max_model_len: int = 4096,
+                 cuda_graphs: bool = True):
         super().__init__(model_id, device, dtype)
         if num_blocks is None:
             per_block = PagedModel.bytes_per_block(self.model, block_size)
@@ -60,6 +61,10 @@ class BatchEngine(Engine):
                 num_blocks = (512 << 20) // per_block   # 512 MiB on CPU
         self.paged = PagedModel(self.model, num_blocks, block_size)
         self.alloc = BlockAllocator(num_blocks)
+        self.graphs = None
+        if cuda_graphs and self.device == "cuda":
+            from .cuda_graphs import CudaGraphDecoder
+            self.graphs = CudaGraphDecoder(self.paged, max_num_seqs, -(-max_model_len // block_size))
         self.block_size = block_size
         self.max_num_seqs = max_num_seqs
         self.max_batched_tokens = max_batched_tokens
@@ -173,7 +178,10 @@ class BatchEngine(Engine):
             end = seq.num_computed + n
             chunks.append(SeqChunk(seq.tokens[seq.num_computed:end], seq.num_computed,
                                    seq.blocks, want_logits=end == len(seq.tokens)))
-        logits = self.paged.forward(chunks)
+        if self.graphs is not None and self.graphs.can_run(chunks):
+            logits = self.graphs.run(chunks)        # pure decode step: replay a CUDA graph
+        else:
+            logits = self.paged.forward(chunks)     # prefill / mixed step: eager
         self.steps += 1
         self.max_running_seen = max(self.max_running_seen, len(self.running))
 

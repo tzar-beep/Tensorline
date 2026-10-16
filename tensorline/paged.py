@@ -69,7 +69,10 @@ class PagedModel:
         self.num_blocks = num_blocks
         p = next(hf_model.parameters())
         self.device, self.dtype = p.device, p.dtype
-        shape = (num_blocks, block_size, self.n_kv, self.head_dim)
+        # One extra block past the allocator's range: a scratch sink for the K/V writes of
+        # padding rows in fixed-shape (CUDA-graph) batches. It is never part of a real sequence.
+        self.scratch_block = num_blocks
+        shape = (num_blocks + 1, block_size, self.n_kv, self.head_dim)
         self.k_cache = [torch.zeros(shape, device=self.device, dtype=self.dtype) for _ in self.inner.layers]
         self.v_cache = [torch.zeros(shape, device=self.device, dtype=self.dtype) for _ in self.inner.layers]
 
@@ -85,6 +88,34 @@ class PagedModel:
         ctx = x.shape[0]
         x = x.transpose(0, 1)[:, None].expand(self.n_kv, self.group, ctx, self.head_dim)
         return x.reshape(1, self.n_heads, ctx, self.head_dim)
+
+    def decode_core(self, ids, pos, slots, tables, lens) -> torch.Tensor:
+        """Pure-tensor decode step for B sequences, one token each, with fixed shapes and no host
+        syncs, so it can be captured in a CUDA graph. ids/pos/slots/lens: [B]; tables: [B, NB].
+        Returns logits [B, vocab]."""
+        B, NB = tables.shape
+        L = NB * self.block_size
+        mask = (torch.arange(L, device=ids.device)[None, :] < lens[:, None])[:, None, None, :]
+        x = self.inner.embed_tokens(ids)
+        cos, sin = self.inner.rotary_emb(x[None], pos[None])
+        cos, sin = cos[0][:, None, :], sin[0][:, None, :]
+        for layer, kc, vc in zip(self.inner.layers, self.k_cache, self.v_cache):
+            attn = layer.self_attn
+            h = layer.input_layernorm(x)
+            q = attn.q_proj(h).view(B, self.n_heads, self.head_dim)
+            k = attn.k_proj(h).view(B, self.n_kv, self.head_dim)
+            v = attn.v_proj(h).view(B, self.n_kv, self.head_dim)
+            q = q * cos + rotate_half(q) * sin
+            k = k * cos + rotate_half(k) * sin
+            kc.view(-1, self.n_kv, self.head_dim).index_copy_(0, slots, k)
+            vc.view(-1, self.n_kv, self.head_dim).index_copy_(0, slots, v)
+            kd = kc[tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
+            vd = vc[tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
+            qd = q.view(B, self.n_kv, self.group, self.head_dim)
+            od = F.scaled_dot_product_attention(qd, kd, vd, attn_mask=mask, scale=self.scale)
+            x = x + attn.o_proj(od.reshape(B, -1))
+            x = x + layer.mlp(layer.post_attention_layernorm(x))
+        return self.hf.lm_head(self.inner.norm(x))
 
     @torch.inference_mode()
     def forward(self, chunks: list[SeqChunk]) -> torch.Tensor:

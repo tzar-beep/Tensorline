@@ -122,13 +122,15 @@ def main():
     ap.add_argument("--max-num-seqs", type=int, default=64)
     ap.add_argument("--max-batched-tokens", type=int, default=2048)
     ap.add_argument("--num-blocks", type=int, default=None, help="KV blocks (default: fit 60%% of free VRAM)")
+    ap.add_argument("--no-cuda-graphs", action="store_true", help="run decode steps eagerly")
     a = ap.parse_args()
     if a.engine == "naive":
         engine = Engine(a.model, a.device, a.dtype)
     else:
         from .batch_engine import BatchEngine
         engine = BatchEngine(a.model, a.device, a.dtype, num_blocks=a.num_blocks,
-                             max_num_seqs=a.max_num_seqs, max_batched_tokens=a.max_batched_tokens)
+                             max_num_seqs=a.max_num_seqs, max_batched_tokens=a.max_batched_tokens,
+                             cuda_graphs=not a.no_cuda_graphs)
     uvicorn.run(create_app(engine), host=a.host, port=a.port)
 
 

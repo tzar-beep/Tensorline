@@ -59,7 +59,7 @@ class Engine:
         else:
             torch_dtype = getattr(torch, dtype)
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype)
+        self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch_dtype)
         self.model.to(self.device).eval()
         # Phase 1 serves strictly one request at a time; this lock is the
         # "naive serving" baseline Phase 2's continuous batching is measured against.
