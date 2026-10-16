@@ -1,0 +1,26 @@
+[project]
+name = "tensorline"
+version = "0.1.0"
+description = "A from-scratch LLM inference and serving engine: continuous batching, paged KV cache, OpenAI-compatible API."
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.3",
+  "transformers>=4.44",
+  "accelerate",
+  "fastapi",
+  "uvicorn[standard]",
+  "httpx",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+tensorline = "tensorline.server:main"
+
+[tool.setuptools]
+packages = ["tensorline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
