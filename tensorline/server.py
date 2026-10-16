@@ -117,8 +117,19 @@ def main():
     ap.add_argument("--dtype", default="auto")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--engine", choices=["batch", "naive"], default="batch",
+                    help="batch: continuous batching + paged KV (Phase 2); naive: one request at a time")
+    ap.add_argument("--max-num-seqs", type=int, default=64)
+    ap.add_argument("--max-batched-tokens", type=int, default=2048)
+    ap.add_argument("--num-blocks", type=int, default=None, help="KV blocks (default: fit 60%% of free VRAM)")
     a = ap.parse_args()
-    uvicorn.run(create_app(Engine(a.model, a.device, a.dtype)), host=a.host, port=a.port)
+    if a.engine == "naive":
+        engine = Engine(a.model, a.device, a.dtype)
+    else:
+        from .batch_engine import BatchEngine
+        engine = BatchEngine(a.model, a.device, a.dtype, num_blocks=a.num_blocks,
+                             max_num_seqs=a.max_num_seqs, max_batched_tokens=a.max_batched_tokens)
+    uvicorn.run(create_app(engine), host=a.host, port=a.port)
 
 
 if __name__ == "__main__":

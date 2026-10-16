@@ -74,7 +74,8 @@ async def main():
     async with httpx.AsyncClient() as c:
         model = a.model or (await c.get(f"{a.url}/v1/models")).json()["data"][0]["id"]
     await run_level(a.url, model, 1, 2, 16)  # warm-up (CUDA kernels, allocator)
-    rows = [await run_level(a.url, model, k, a.requests, a.max_tokens) for k in a.concurrency]
+    # at least 2 requests per client so every level reaches steady state
+    rows = [await run_level(a.url, model, k, max(a.requests, 2 * k), a.max_tokens) for k in a.concurrency]
     print(f"{'conc':>4} {'TTFT p50':>9} {'TTFT p99':>9} {'lat p50':>8} {'lat p99':>8} {'tok/s':>7} {'tok/s/req':>9}")
     for r in rows:
         print(f"{r['concurrency']:>4} {r['ttft_p50_ms']:>7.0f}ms {r['ttft_p99_ms']:>7.0f}ms "
