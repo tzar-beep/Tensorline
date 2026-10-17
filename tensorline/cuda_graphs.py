@@ -45,6 +45,9 @@ class CudaGraphDecoder:
         self.out = torch.empty(max_batch, vocab, device=pm.device, dtype=pm.dtype)
         self.graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]] = {}
         self.replays = 0
+        # One warm-up stream for every capture: each new stream gets its own cuBLAS workspace
+        # (~8 MiB each), which leaked ~260 MiB across 42 captures before this was shared.
+        self.side = torch.cuda.Stream()
 
     def can_run(self, chunks: list[SeqChunk]) -> bool:
         return (len(chunks) <= self.batch_buckets[-1]
@@ -67,7 +70,7 @@ class CudaGraphDecoder:
         def step():
             self.out[:B].copy_(self.pm.decode_core(ids, pos, slots, tables, lens))
 
-        side = torch.cuda.Stream()
+        side = self.side
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):          # warm-up: lazy inits, cuBLAS handles, allocator
             for _ in range(2):
@@ -77,6 +80,20 @@ class CudaGraphDecoder:
         with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
             step()
         self.graphs[(B, NB)] = (g, buf, host)
+
+    def warmup(self, max_context_tokens: int) -> int:
+        """Capture every batch bucket for contexts up to `max_context_tokens` before serving, so
+        early requests don't pay ~50-100 ms of lazy capture per new bucket (it showed up as
+        multi-second p99 TTFT). Capture runs only touch the scratch KV block. Returns #graphs."""
+        nb_max = -(-max_context_tokens // self.pm.block_size)
+        nbs = [nb for nb in self.block_buckets if nb <= nb_max] or self.block_buckets[:1]
+        # Largest first: later (smaller) captures reuse the shared pool's blocks.
+        for NB in reversed(nbs):
+            for B in reversed(self.batch_buckets):
+                if (B, NB) not in self.graphs:
+                    self._capture(B, NB)
+        torch.cuda.synchronize()
+        return len(self.graphs)
 
     @torch.inference_mode()
     def run(self, chunks: list[SeqChunk]) -> torch.Tensor:

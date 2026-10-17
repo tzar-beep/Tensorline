@@ -60,7 +60,7 @@ if _OK:
     @triton.jit
     def _w4a16_kernel(x_ptr, q_ptr, s_ptr, m_ptr, p_ptr, M, N, K, G_PER_SPLIT, sxm, sqn, ssn,
                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GROUP: tl.constexpr,
-                      SPLIT: tl.constexpr):
+                      SPLIT: tl.constexpr, FOLD: tl.constexpr):
         HALF: tl.constexpr = GROUP // 2
         pid_n, pid_s, pid_m = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -77,11 +77,16 @@ if _OK:
             p = tl.load(q_ptr + rn[:, None] * sqn + (g * HALF + rh)[None, :], mask=nmask[:, None], other=0)
             ql = (p & 0xF).to(tl.float16)
             qh = (p >> 4).to(tl.float16)
-            dot = tl.dot(xl, tl.trans(ql)) + tl.dot(xh, tl.trans(qh))          # [BM, BN] fp32
-            xsum = tl.sum(xl.to(tl.float32), axis=1) + tl.sum(xh.to(tl.float32), axis=1)
-            s = tl.load(s_ptr + rn * ssn + g, mask=nmask, other=0.0).to(tl.float32)
-            mn = tl.load(m_ptr + rn * ssn + g, mask=nmask, other=0.0).to(tl.float32)
-            acc += dot * s[None, :] + xsum[:, None] * mn[None, :]
+            if FOLD:   # small M: scale/offset applied to the [BM, BN] dot once per group
+                dot = tl.dot(xl, tl.trans(ql)) + tl.dot(xh, tl.trans(qh))      # [BM, BN] fp32
+                xsum = tl.sum(xl.to(tl.float32), axis=1) + tl.sum(xh.to(tl.float32), axis=1)
+                s = tl.load(s_ptr + rn * ssn + g, mask=nmask, other=0.0).to(tl.float32)
+                mn = tl.load(m_ptr + rn * ssn + g, mask=nmask, other=0.0).to(tl.float32)
+                acc += dot * s[None, :] + xsum[:, None] * mn[None, :]
+            else:      # large M: dequantise the [BN, G] tile once (cost independent of M), plain dots
+                s = tl.load(s_ptr + rn * ssn + g, mask=nmask, other=0.0)[:, None]
+                mn = tl.load(m_ptr + rn * ssn + g, mask=nmask, other=0.0)[:, None]
+                acc += tl.dot(xl, tl.trans(ql * s + mn)) + tl.dot(xh, tl.trans(qh * s + mn))
         tl.store(p_ptr + pid_s * M * N + rm[:, None] * N + rn[None, :], acc,
                  mask=mmask[:, None] & nmask[None, :])
 
@@ -99,6 +104,7 @@ def _plan(M: int, N: int, k_steps: int, max_block_m: int = 64) -> tuple[int, int
     return block_m, block_n, split
 
 
+FOLD_MAX_BM = 32   # int4 tiles with more rows than this dequantise the weight tile instead of folding
 MAX_BM_INT4 = 64   # tried 32 (M=64 as two row tiles): 0.6-0.8x vs 0.74-0.82x at 64, so kept at 64
 
 
@@ -123,5 +129,5 @@ def qmatmul(x: torch.Tensor, layer) -> torch.Tensor:
         _w4a16_kernel[(triton.cdiv(N, block_n), split, triton.cdiv(M, block_m))](
             x, layer.qweight, layer.scale, layer.minv, part, M, N, K, g_per,
             x.stride(0), layer.qweight.stride(0), layer.scale.stride(0),
-            BLOCK_M=block_m, BLOCK_N=block_n, GROUP=layer.group, SPLIT=split)
+            BLOCK_M=block_m, BLOCK_N=block_n, GROUP=layer.group, SPLIT=split, FOLD=block_m <= FOLD_MAX_BM)
     return (part[0] if split == 1 else part.sum(0)).to(x.dtype)

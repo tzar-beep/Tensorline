@@ -75,7 +75,8 @@ class BatchEngine(Engine):
                  kv_mem_fraction: float = 0.6, max_num_seqs: int = 64,
                  max_batched_tokens: int = 2048, max_model_len: int = 4096,
                  cuda_graphs: bool = True, prefix_caching: bool = True,
-                 quant: str | None = None, kv_cache_gb: float | None = None):
+                 quant: str | None = None, kv_cache_gb: float | None = None,
+                 graph_warmup_tokens: int = 512):
         super().__init__(model_id, device, dtype, quant)
         if self.quant and self.device == "cuda":
             self._warm_quant_kernels(max_num_seqs)
@@ -99,6 +100,8 @@ class BatchEngine(Engine):
         if cuda_graphs and self.device == "cuda":
             from .cuda_graphs import CudaGraphDecoder
             self.graphs = CudaGraphDecoder(self.paged, max_num_seqs, -(-max_model_len // block_size))
+            if graph_warmup_tokens:
+                self.graphs.warmup(min(graph_warmup_tokens, max_model_len))
         self.block_size = block_size
         self.max_num_seqs = max_num_seqs
         self.max_batched_tokens = max_batched_tokens

@@ -5,7 +5,15 @@ models behind an OpenAI-compatible API, and is built up phase by phase toward co
 a paged KV cache, quantisation and multi-model serving, with every claim backed by a reproducible
 benchmark.
 
-> Status: **Phases 1–5 complete** (vLLM comparison skipped: no native Windows support). **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, CUDA-graph decode and automatic prefix caching.
+[![ci](https://github.com/tzar-beep/Tensorline/actions/workflows/ci.yml/badge.svg)](https://github.com/tzar-beep/Tensorline/actions/workflows/ci.yml)
+
+> Status: **all five phases complete.** Everything below was measured on one RTX 3050 Laptop GPU (6 GB).
+
+**Highlights**
+- **2.5× Ollama's throughput** at 64 concurrent requests (1,877 vs 751 tok/s), with the same model and GPU, run back to back.
+- **80× over naive one-at-a-time serving** at peak (15.8 → 1,259 tok/s, back to back), through a paged KV cache, continuous batching and CUDA graphs; later optimisations reach 1,877 tok/s.
+- **Serves a 3B model that does not fit in VRAM at fp16** (728 tok/s), using hand-written fused int4/int8 Triton kernels (int8: lossless perplexity).
+- **Correctness by differential testing**: the paged engine is token-identical to a reference engine under chunked prefill, preemption and prefix sharing; 70 tests (the CPU subset runs in CI; GPU tests run locally).
 
 ## Quickstart
 
@@ -199,9 +207,11 @@ The int4 ablation on 0.5B: group size 64 gives 19.15, group 32 gives 17.79, and 
 keeps the fast 128-wide kernel.
 
 **Kernel speed** (GPU time inside a CUDA graph, vs fp16 cuBLAS): at decode sizes (M ≤ 16), int8
-is **1.4–1.8×** and int4 **1.5–2.2×** faster across the 0.5B–3B layer shapes. At M = 64, int8
-is 1.2–1.5× faster, but int4 is **slower (0.74–0.82×)**. Its tile becomes compute-bound, which is
-a known limitation and next on the list.
+is **1.4–1.8×** and int4 **1.5–2.2×** faster across the 0.5B–3B layer shapes. At M = 64, the
+first int4 kernel was *slower* than fp16 (0.74–0.82×): its per-group rescale of the whole
+[M × N] fp32 accumulator grows with M. For 64-row tiles, the kernel now dequantises the
+[N × 128] weight tile to fp16 instead (cost independent of M) and runs plain dots. int4 at M = 64
+is now **1.16–1.50× faster** than fp16, and int8 1.22–1.47×.
 
 **Serving** (output tok/s through the server, back to back; `TAG=... RUNS="q-none q-int8 q-int4" bash bench/run_compare.sh <model>`)
 
@@ -209,18 +219,21 @@ a known limitation and next on the list.
 |---|---:|---:|---:|---:|
 | 0.5B | 1  | 92.8  | **108.7** | 104.3 |
 | 0.5B | 64 | **1628.6** | 1564.0 | 1362.4 |
-| 1.5B | 1  | 41.9  | 52.1 | **54.4** (+30%) |
-| 1.5B | 16 | 321.4 | **352.1** | 321.5 |
-| 1.5B | 64 | 857.7 | **987.5** (+15%) | 766.5 |
-| 3B | 1  | doesn't fit | 20.9 | **31.1** (+49%) |
-| 3B | 16 | doesn't fit | 105.9 | **183.8** (+74%) |
-| 3B | 64 | doesn't fit | 352.2 | **462.3** (+31%) |
+| 1.5B | 1  | 45.3  | **60.6** (+34%) | 60.2 |
+| 1.5B | 16 | 371.2 | **404.2** | 338.7 |
+| 1.5B | 64 | 1108.0 | **1155.1** | 1044.2 |
+| 3B | 1  | doesn't fit | 32.1 | **35.6** |
+| 3B | 16 | doesn't fit | **257.1** | 251.2 |
+| 3B | 64 | doesn't fit | **727.7** | 672.5 |
 
-**Qwen2.5-3B does not fit in this 6 GB GPU at fp16; quantised, it serves at 462 tok/s**. At 3B,
-int4 beats int8 at every concurrency, because the weights dominate memory traffic.
-Quantisation pays off for single streams and larger models, where weight streaming dominates.
-At 0.5B, the fp16 embedding/LM head (272 MB) is a large share of the bytes, so the gains are
-small. int4 at high concurrency is held back by the M = 64 kernel limitation above.
+**Qwen2.5-3B does not fit in this 6 GB GPU at fp16; quantised, it serves at 728 tok/s.**
+Quantisation pays off most for single streams on larger models (+34% at 1.5B), where streaming
+the weights dominates each step. At high concurrency, int8 and int4 land within about 10% of
+each other: the step becomes more compute- and overhead-bound, and int4's extra unpacking offsets
+its smaller weights. int4's main win is memory (2.32 vs 3.17 GB at 3B), which leaves more KV
+cache or room for a second model. At 0.5B, the fp16 embedding/LM head (272 MB) is a large share
+of the bytes, so quantisation gains are small. (The 0.5B rows predate the latest kernel work; 1.5B
+and 3B were re-run after it.)
 
 ### Multi-model serving (Phase 3)
 
@@ -353,26 +366,27 @@ Correctness is checked by **differential testing** against reference implementat
 
 ## Roadmap
 
-Each phase ships finished and demoable, with benchmark numbers, before the next starts.
+Each phase shipped finished and demoable, with benchmark numbers, before the next started.
 
-1. **Single-model server** ✅: load an open model with a CPU fallback, stream tokens, OpenAI-compatible
-   `/v1/chat/completions`.
-2. **Continuous batching + KV-cache management** ✅: an iteration-level scheduler, a paged KV cache
-   (16-token blocks, a block table per sequence, free-list allocator), chunked prefill, and
-   recompute preemption, and CUDA-graph decode (5.9× single-stream, 80× peak throughput vs naive).
-   Automatic prefix caching gives +54% throughput and 5× lower p99 TTFT on a shared-system-prompt workload.
-   A thread-free streaming path adds +24% at concurrency 64 (1,498 tok/s).
-   - *Next:* overlap CPU scheduling with GPU execution: prepare step t+1's inputs while step t's
-     graph runs, which hides the remaining ~7 ms of Python per step.
-3. **Quantisation + multi-model**: int8 and 4-bit weights (bitsandbytes first, then a hand-written
-   int8 matmul for comparison), loading and unloading several models under a VRAM budget with LRU
-   eviction, and quality checks (perplexity delta) for each quantisation mode.
-4. **Benchmark harness**: tokens/sec, TTFT and p50/p99 latency against concurrency; comparisons
-   with Phase 1 naive serving, Hugging Face `generate`, Ollama, and vLLM (via WSL2/Docker, where
-   it runs on this GPU); charts generated from JSON results.
-5. **Production polish**: Prometheus `/metrics` (queue depth, batch size, KV-block utilisation,
-   TTFT histograms) with a Grafana dashboard, Docker (CUDA base image), CI running the test suite,
-   and the final README charts.
+1. **Single-model server** ✅: an OpenAI-compatible `/v1/chat/completions` with SSE streaming, a
+   hand-written prefill/decode loop that matches HF `generate` token for token, and a CPU fallback.
+2. **Continuous batching + KV-cache management** ✅: a paged KV cache (16-token blocks, block
+   tables, ref-counted allocator), an iteration-level scheduler, chunked prefill, recompute
+   preemption, automatic prefix caching, CUDA-graph decode, batched prefill attention, fused
+   RMSNorm/RoPE kernels, and a thread-free streaming path.
+3. **Quantisation + multi-model** ✅: W8A16/W4A16 with hand-written fused Triton kernels (my own
+   instead of bitsandbytes, so they work inside CUDA graphs), a mixed-precision int4 policy chosen
+   by a WikiText-2 ablation, a 3B model that does not fit at fp16 served on 6 GB, and a
+   multi-model manager with VRAM budgeting, LRU eviction and verified leak-free unloading.
+4. **Benchmark harness** ✅: an OpenAI-compatible streaming load generator (TTFT, p50/p99, tok/s
+   vs concurrency, cache hits), back-to-back comparison scripts, perplexity evaluation, and a
+   comparison against Ollama. vLLM is skipped because it does not run natively on Windows.
+5. **Production polish** ✅: Prometheus `/metrics`, a live dashboard website, Docker, GitHub
+   Actions CI, and README charts.
+
+**Possible next steps:** an overlap scheduler (build step t+1's inputs while step t's graph runs,
+hiding the remaining host time per step), speculative decoding, and a C++/CUDA paged-attention
+kernel to replace the gather + SDPA decode path.
 
 ## Stack: what and why
 
