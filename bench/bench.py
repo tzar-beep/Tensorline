@@ -37,6 +37,7 @@ async def one(client, url, model, prompt, max_tokens, system=None):
     ttft, ntok, cached, ptok = None, 0, 0, 0
     msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
     payload = {"model": model, "stream": True, "max_tokens": max_tokens, "temperature": 0,
+               "stream_options": {"include_usage": True},   # OpenAI: usage in the final chunk
                "messages": msgs}
     async with client.stream("POST", f"{url}/v1/chat/completions", json=payload) as r:
         async for line in r.aiter_lines():

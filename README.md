@@ -5,7 +5,7 @@ models behind an OpenAI-compatible API, and is built up phase by phase toward co
 a paged KV cache, quantisation and multi-model serving, with every claim backed by a reproducible
 benchmark.
 
-> Status: **Phases 1–3 and 5 complete**; Phase 4's comparison against Ollama/vLLM is pending. **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, CUDA-graph decode and automatic prefix caching.
+> Status: **Phases 1–5 complete** (vLLM comparison skipped: no native Windows support). **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, CUDA-graph decode and automatic prefix caching.
 
 ## Quickstart
 
@@ -71,6 +71,32 @@ What the numbers show:
   (64 tokens / 20 ms). End to end, the server reaches 1,259 tok/s, about 40% of that. The rest
   is host-side work: the Python scheduler, incremental detokenisation and SSE streaming. That is
   the next bottleneck to attack.
+
+### vs Ollama (Phase 4)
+
+Both servers run the same model, Qwen2.5-0.5B-Instruct fp16, on the same GPU with the same
+client (`bench/bench.py`, OpenAI API, streaming, 128 output tokens). The run used
+[`bench/run_vs_ollama.sh`](bench/run_vs_ollama.sh) with Ollama 0.35.1, all layers on the GPU,
+flash attention on, and a 512-token context per slot. Ollama was tried with 64 and with 16
+parallel slots, and the better config (16) is shown. With 64 slots, llama-server spends its time
+saving idle slots to its host-side prompt cache and collapses to 94 tok/s at concurrency 16
+([raw](bench/results/vs_ollama.json)).
+
+| Concurrency | Ollama tok/s | **Tensorline tok/s** | Ollama TTFT p50 | **Tensorline TTFT p50** | Ollama latency p99 | **Tensorline latency p99** |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1  | **121.1** | 91.7  | **27 ms** | 84 ms   | **1.06 s** | 1.96 s |
+| 4  | **312.3** | 231.5 | **55 ms** | 128 ms  | **1.86 s** | 2.73 s |
+| 16 | 433.4 | **623.4** (1.4×) | **162 ms** | 251 ms | 4.94 s | **2.81 s** |
+| 64 | 721.2 | **1597.0** (2.2×) | 5.13 s | **724 ms** | 9.85 s | **4.79 s** |
+
+([Tensorline](bench/results/vs_tensorline.json), [Ollama, 16 slots](bench/results/vs_ollama_p16.json).)
+Ollama (llama.cpp: C++ and hand-tuned CUDA, no Python on the hot path) is faster at low
+concurrency, about 1.3× at 1–4 streams. Tensorline wins once batching matters: 1.4× the
+throughput at 16 and 2.2× at 64, with half the p99 latency. At 64 concurrent requests, Ollama
+queues everything beyond its fixed 16 slots, while Tensorline's paged KV cache and
+iteration-level scheduler admit all of them. The remaining gap at low concurrency is the ~7 ms of
+Python per step identified above. The two systems ran minutes apart in one session, not strictly
+interleaved. vLLM is not compared: it does not support native Windows.
 
 ### Host-side path: thread-free streaming
 
