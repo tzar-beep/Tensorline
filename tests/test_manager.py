@@ -128,3 +128,17 @@ def test_metrics_endpoint_reports_engine_activity():
     assert vals[f'tensorline_time_to_first_token_seconds_bucket{{{m},le="+Inf"}}'] == 3
     assert vals[f"tensorline_kv_blocks_free{{{m}}}"] == vals[f"tensorline_kv_blocks_total{{{m}}}"]
     assert vals[f"tensorline_prefix_cache_hit_tokens_total{{{m}}}"] > 0     # same prompt 3x
+
+
+def test_dashboard_stats_and_burst_endpoints():
+    eng = cpu_factory(ModelSpec("m", TINY))
+    c = TestClient(create_app(eng))
+    page = c.get("/")
+    assert page.status_code == 200 and "<title>Tensorline</title>" in page.text
+    r = c.post("/admin/burst", json={"n": 6, "max_tokens": 4}).json()
+    assert r["n"] == 6 and r["tokens"] > 0 and r["tok_s"] > 0
+    s = c.get("/api/stats").json()
+    e = s["engines"][TINY]
+    assert e["tokens_generated"] == r["tokens"] and sum(e["finished"].values()) == 6
+    assert sum(e["ttft"]["counts"]) == 6 and e["kv_free"] == e["kv_total"]
+    assert c.post("/admin/burst", json={"n": 0}).status_code == 422

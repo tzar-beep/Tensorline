@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tensorline</title>
+<style>
+:root {
+  --surface-0: #f4f4f1; --surface-1: #fcfcfb; --border: #e4e3df; --grid: #ecebe7;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #77766f;
+  --series-1: #2a78d6; --accent: #2a78d6; --good: #0e7a3e; --critical: #c62d2d;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-0: #111110; --surface-1: #1a1a19; --border: #2f2f2c; --grid: #262624;
+    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #9a998f;
+    --series-1: #3987e5; --accent: #3987e5; --good: #4cc27c; --critical: #ef6a6a;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--surface-0); color: var(--text-primary);
+       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 16px; }
+h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+.sub { color: var(--text-secondary); }
+.pill { font: 12px var(--mono); padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px;
+        background: var(--surface-1); color: var(--text-secondary); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); margin-right: 6px; }
+.dot.off { background: var(--critical); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.tile .label { color: var(--text-secondary); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .note { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.card h2 { font-size: 14px; margin: 0 0 8px; font-weight: 600; }
+.chart { position: relative; }
+.chart svg { width: 100%; height: 180px; display: block; }
+.tip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+       border-radius: 6px; padding: 4px 8px; font-size: 12px; white-space: nowrap; display: none;
+       box-shadow: 0 2px 8px rgba(0,0,0,.12); font-variant-numeric: tabular-nums; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+select, input, textarea, button { font: inherit; color: var(--text-primary); background: var(--surface-0);
+       border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+textarea { width: 100%; min-height: 72px; resize: vertical; }
+button { background: var(--accent); color: #fff; border-color: transparent; cursor: pointer; font-weight: 600; }
+button.secondary { background: var(--surface-0); color: var(--text-primary); border-color: var(--border); }
+button:disabled { opacity: .55; cursor: default; }
+#out { white-space: pre-wrap; min-height: 96px; margin-top: 10px; padding: 10px; border-radius: 8px;
+       background: var(--surface-0); border: 1px solid var(--border); }
+.stats { color: var(--text-secondary); font: 12px var(--mono); margin-top: 6px; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+th { color: var(--text-secondary); font-weight: 500; font-size: 12px; }
+a { color: var(--accent); }
+.hidden { display: none; }
+@media (max-width: 480px) { .tile .value { font-size: 22px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Tensorline</h1>
+    <span class="sub"><span id="live" class="dot off"></span><span id="status">connecting…</span></span>
+    <span id="pills" class="row"></span>
+    <span style="flex:1"></span>
+    <a href="/docs">API docs</a><a href="/metrics">Prometheus</a>
+  </header>
+
+  <section class="tiles" aria-label="Live engine stats">
+    <div class="card tile"><div class="label">Output throughput</div><div class="value" id="t-tps">–</div><div class="note">tokens/s, last 2 s</div></div>
+    <div class="card tile"><div class="label">Running batch</div><div class="value" id="t-run">–</div><div class="note" id="t-wait">waiting –</div></div>
+    <div class="card tile"><div class="label">KV cache in use</div><div class="value" id="t-kv">–</div><div class="note" id="t-kvn">–</div></div>
+    <div class="card tile"><div class="label">Prefix-cache hits</div><div class="value" id="t-hit">–</div><div class="note">of prompt tokens</div></div>
+    <div class="card tile"><div class="label">Time to first token</div><div class="value" id="t-ttft">–</div><div class="note" id="t-ttft95">p50, last 30 s</div></div>
+    <div class="card tile"><div class="label">Generated</div><div class="value" id="t-gen">–</div><div class="note" id="t-req">requests –</div></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card"><h2>Output tokens/s · last 2 min</h2><div class="chart" id="c-tps"></div></div>
+    <div class="card"><h2>Sequences in the running batch · last 2 min</h2><div class="chart" id="c-run"></div></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h2>Chat playground</h2>
+      <div class="row" style="margin-bottom:8px">
+        <select id="model" aria-label="Model"></select>
+        <label class="sub">max tokens <input id="maxtok" type="number" value="128" min="1" max="2048" style="width:80px"></label>
+      </div>
+      <textarea id="prompt" aria-label="Prompt">Explain continuous batching in LLM serving in three sentences.</textarea>
+      <div class="row" style="margin-top:8px">
+        <button id="send">Send</button>
+        <span class="stats" id="chatstats"></span>
+      </div>
+      <div id="out" aria-live="polite"></div>
+    </div>
+    <div class="card">
+      <h2>Load generator</h2>
+      <p class="sub" style="margin-top:0">Runs concurrent generations inside the server (a browser page can only hold 6 connections) and the batch fills up in the charts.</p>
+      <div class="row">
+        <label class="sub">concurrent <select id="burst-n"><option>4</option><option selected>16</option><option>32</option><option>64</option></select></label>
+        <label class="sub">tokens each <select id="burst-tok"><option>64</option><option selected>128</option><option>256</option></select></label>
+        <button id="burst">Run burst</button>
+      </div>
+      <div class="stats" id="burststats"></div>
+      <div id="models-card" class="hidden" style="margin-top:16px">
+        <h2>Models</h2>
+        <table><thead><tr><th>Name</th><th>Quant</th><th>State</th><th>In flight</th><th>Memory</th><th></th></tr></thead>
+        <tbody id="models"></tbody></table>
+        <div class="stats" id="budget"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const HIST = 120;                                  // seconds of history kept for the charts
+const history = [];                                // {t, tps, run}
+const snaps = [];                                  // raw /api/stats snapshots (for windowed deltas)
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const fmt = (n, d = 0) => n == null || !isFinite(n) ? "–" : n.toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d});
+
+function sum(engines, key) { return Object.values(engines).reduce((a, e) => a + (e[key] || 0), 0); }
+
+function pctFromHist(nowE, oldE, key, p) {           // upper bound of the bucket holding the p-quantile
+  let buckets = null, counts = null;
+  for (const [name, e] of Object.entries(nowE)) {
+    const o = oldE && oldE[name];
+    const c = e[key].counts.map((v, i) => v - (o ? o[key].counts[i] : 0));
+    buckets = e[key].buckets;
+    counts = counts ? counts.map((v, i) => v + c[i]) : c;
+  }
+  if (!counts) return null;
+  const n = counts.reduce((a, b) => a + b, 0);
+  if (!n) return null;
+  let cum = 0;
+  for (let i = 0; i < counts.length; i++) {
+    cum += counts[i];
+    if (cum >= p * n) return i < buckets.length ? buckets[i] : Infinity;
+  }
+  return Infinity;
+}
+const secs = (v) => v == null ? "–" : v === Infinity ? "> 60 s" : v < 1 ? `≤ ${Math.round(v * 1000)} ms` : `≤ ${v} s`;
+
+// ---------- line chart with crosshair + tooltip ----------
+function lineChart(el, key, unit, digits) {
+  el.innerHTML = '<svg role="img"></svg><div class="tip"></div>';
+  const svg = el.querySelector("svg"), tip = el.querySelector(".tip");
+  const W = 600, H = 180, L = 44, R = 10, T = 10, B = 22;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("aria-label", `${unit} over the last two minutes`);
+  let pts = [];
+  function nice(m) { if (m <= 0) return 1; const e = Math.pow(10, Math.floor(Math.log10(m))); const f = m / e;
+                     return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e; }
+  function draw() {
+    pts = history.map((h) => [h.t, h[key]]);
+    const now = Date.now() / 1000, x0 = now - HIST;
+    const ymax = nice(Math.max(1, ...pts.map((p) => p[1])) * 1.1);
+    const x = (t) => L + (W - L - R) * (t - x0) / HIST, y = (v) => T + (H - T - B) * (1 - v / ymax);
+    let g = "";
+    for (let i = 0; i <= 4; i++) {
+      const v = ymax * i / 4, yy = y(v).toFixed(1);
+      g += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="${css("--grid")}" stroke-width="1"/>`;
+      g += `<text x="${L - 6}" y="${+yy + 4}" text-anchor="end" font-size="11" fill="${css("--text-muted")}">${fmt(v, v < 10 && ymax < 10 ? 1 : 0)}</text>`;
+    }
+    for (const s of [120, 90, 60, 30, 0]) {
+      g += `<text x="${x(now - s)}" y="${H - 6}" text-anchor="middle" font-size="11" fill="${css("--text-muted")}">${s ? "-" + s + "s" : "now"}</text>`;
+    }
+    const vis = pts.filter((p) => p[0] >= x0);
+    if (vis.length > 1) {
+      const d = vis.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join(" ");
+      g += `<path d="${d}" fill="none" stroke="${css("--series-1")}" stroke-width="2" stroke-linejoin="round"/>`;
+    }
+    g += `<g class="hover"></g><rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent"/>`;
+    svg.innerHTML = g;
+    svg._x = x; svg._y = y; svg._vis = vis;
+  }
+  svg.addEventListener("mousemove", (ev) => {
+    const vis = svg._vis || []; if (!vis.length) return;
+    const r = svg.getBoundingClientRect(), sx = (ev.clientX - r.left) * W / r.width;
+    let best = vis[0];
+    for (const p of vis) if (Math.abs(svg._x(p[0]) - sx) < Math.abs(svg._x(best[0]) - sx)) best = p;
+    const cx = svg._x(best[0]), cy = svg._y(best[1]);
+    svg.querySelector(".hover").innerHTML =
+      `<line x1="${cx}" x2="${cx}" y1="${T}" y2="${H - B}" stroke="${css("--text-muted")}" stroke-dasharray="3 3"/>` +
+      `<circle cx="${cx}" cy="${cy}" r="4.5" fill="${css("--series-1")}" stroke="${css("--surface-1")}" stroke-width="2"/>`;
+    const ago = Math.max(0, Math.round(Date.now() / 1000 - best[0]));
+    tip.textContent = `${fmt(best[1], digits)} ${unit} · ${ago ? ago + " s ago" : "now"}`;
+    tip.style.display = "block";
+    const px = cx * r.width / W, py = cy * r.height / H;
+    tip.style.left = Math.min(px + 10, r.width - tip.offsetWidth - 4) + "px";
+    tip.style.top = Math.max(py - 34, 0) + "px";
+  });
+  svg.addEventListener("mouseleave", () => { tip.style.display = "none"; svg.querySelector(".hover").innerHTML = ""; });
+  return draw;
+}
+const drawTps = lineChart($("c-tps"), "tps", "tok/s", 0);
+const drawRun = lineChart($("c-run"), "run", "sequences", 0);
+
+// ---------- polling ----------
+let lastModels = "";
+async function poll() {
+  let s;
+  try { s = await (await fetch("/api/stats")).json(); }
+  catch { $("live").className = "dot off"; $("status").textContent = "server unreachable"; return; }
+  $("live").className = "dot"; $("status").textContent = "live";
+  snaps.push(s); while (snaps.length > 40) snaps.shift();
+  const E = s.engines, prev = snaps.length > 2 ? snaps[snaps.length - 3] : null;
+  const tps = prev ? (sum(E, "tokens_generated") - sum(prev.engines, "tokens_generated")) / (s.time - prev.time) : 0;
+  const run = sum(E, "running");
+  history.push({t: s.time, tps: Math.max(0, tps), run}); while (history.length && history[0].t < s.time - HIST - 2) history.shift();
+
+  const pills = Object.entries(E).map(([n, e]) => `<span class="pill">${n} · ${e.quant} · ${e.device} · ${fmt(e.weights_gb, 2)} GB</span>`).join("");
+  $("pills").innerHTML = pills;
+  $("t-tps").textContent = fmt(tps);
+  $("t-run").textContent = fmt(run);
+  $("t-wait").textContent = `waiting ${fmt(sum(E, "waiting"))}`;
+  const kt = sum(E, "kv_total"), kf = sum(E, "kv_free");
+  $("t-kv").textContent = kt ? fmt(100 * (kt - kf) / kt, 1) + "%" : "–";
+  $("t-kvn").textContent = kt ? `${fmt(kt - kf)} of ${fmt(kt)} blocks · ${fmt(sum(E, "kv_cached"))} cached` : "–";
+  const pt = sum(E, "prompt_tokens");
+  $("t-hit").textContent = pt ? fmt(100 * sum(E, "prefix_hit_tokens") / pt, 0) + "%" : "–";
+  const old = snaps.find((x) => x.time >= s.time - 30) || snaps[0];
+  const oldE = old === s ? null : old.engines;
+  $("t-ttft").textContent = secs(pctFromHist(E, oldE, "ttft", 0.5));
+  $("t-ttft95").textContent = `p50 · p95 ${secs(pctFromHist(E, oldE, "ttft", 0.95))} · last 30 s`;
+  $("t-gen").textContent = fmt(sum(E, "tokens_generated"));
+  const fin = Object.values(E).reduce((a, e) => a + Object.values(e.finished).reduce((x, y) => x + y, 0), 0);
+  $("t-req").textContent = `${fmt(fin)} requests · ${fmt(sum(E, "preemptions"))} preemptions`;
+  drawTps(); drawRun();
+
+  const ids = s.models.map((m) => m.name).join(",");
+  if (ids !== lastModels) {
+    lastModels = ids;
+    $("model").innerHTML = s.models.map((m) => `<option value="${m.name}">${m.name}</option>`).join("");
+  }
+  if (s.multi_model) {
+    $("models-card").classList.remove("hidden");
+    $("models").innerHTML = s.models.map((m) => `<tr><td>${m.name}</td><td>${m.quant}</td>
+      <td>${m.loaded ? "loaded" : "unloaded"}</td><td>${m.inflight}</td><td>${fmt(m.footprint_gb, 2)} GB</td>
+      <td><button class="secondary" data-act="${m.loaded ? "unload" : "load"}" data-name="${m.name}">${m.loaded ? "Unload" : "Load"}</button></td></tr>`).join("");
+    $("budget").textContent = `${fmt(s.used_gb, 2)} of ${fmt(s.budget_gb, 2)} GB budget · ${s.evictions} evictions`;
+  }
+}
+$("models").addEventListener("click", async (ev) => {
+  const b = ev.target.closest("button"); if (!b) return;
+  b.disabled = true;
+  const r = await fetch(`/admin/models/${encodeURIComponent(b.dataset.name)}/${b.dataset.act}`, {method: "POST"});
+  if (!r.ok) alert((await r.json()).detail || r.statusText);
+  poll();
+});
+setInterval(poll, 1000); poll();
+
+// ---------- streaming chat ----------
+async function stream(body, onDelta) {
+  const t0 = performance.now(); let ttft = null, usage = null;
+  const r = await fetch("/v1/chat/completions", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({...body, stream: true})});
+  if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+  const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+  for (;;) {
+    const {value, done} = await reader.read(); if (done) break;
+    buf += dec.decode(value, {stream: true});
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+      const c = JSON.parse(line.slice(6));
+      if (c.usage) usage = c.usage;
+      const d = c.choices && c.choices[0] && c.choices[0].delta.content;
+      if (d) { if (ttft == null) ttft = performance.now() - t0; onDelta && onDelta(d); }
+    }
+  }
+  return {ttft, total: performance.now() - t0, usage};
+}
+$("send").addEventListener("click", async () => {
+  $("send").disabled = true; $("out").textContent = ""; $("chatstats").textContent = "generating…";
+  try {
+    const res = await stream({model: $("model").value, max_tokens: +$("maxtok").value,
+      messages: [{role: "user", content: $("prompt").value}]}, (d) => { $("out").textContent += d; });
+    const n = res.usage ? res.usage.completion_tokens : 0;
+    const cached = res.usage && res.usage.prompt_tokens_details ? res.usage.prompt_tokens_details.cached_tokens : 0;
+    $("chatstats").textContent = `TTFT ${fmt(res.ttft)} ms · ${n} tokens · ${fmt(n / ((res.total - res.ttft) / 1000), 1)} tok/s · ${cached} prompt tokens cached`;
+  } catch (e) { $("chatstats").textContent = "error: " + e.message; }
+  $("send").disabled = false;
+});
+$("burst").addEventListener("click", async () => {
+  const n = +$("burst-n").value, tok = +$("burst-tok").value;
+  $("burst").disabled = true; $("burststats").textContent = `running ${n} concurrent requests…`;
+  try {
+    const r = await fetch("/admin/burst", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({n, max_tokens: tok, model: $("model").value})});
+    const b = await r.json();
+    if (!r.ok) throw new Error(b.detail || r.statusText);
+    $("burststats").textContent = `${b.n} requests · ${fmt(b.tokens)} tokens in ${fmt(b.seconds, 2)} s = ${fmt(b.tok_s)} tok/s · TTFT p50 ${fmt(b.ttft_p50_ms)} ms, max ${fmt(b.ttft_max_ms)} ms`;
+  } catch (e) { $("burststats").textContent = "error: " + e.message; }
+  $("burst").disabled = false;
+});
+</script>
+</body>
+</html>

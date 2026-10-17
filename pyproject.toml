@@ -21,6 +21,9 @@ tensorline = "tensorline.server:main"
 [tool.setuptools]
 packages = ["tensorline"]
 
+[tool.setuptools.package-data]
+tensorline = ["static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

@@ -83,19 +83,38 @@ tok/s at concurrency 16 ([raw](bench/results/vs_ollama.json)).
 
 | Concurrency | Ollama tok/s | **Tensorline tok/s** | Ollama TTFT p50 | **Tensorline TTFT p50** | Ollama latency p99 | **Tensorline latency p99** |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1  | **121.9** | 112.0 | **26 ms** | 45 ms  | **1.06 s** | 1.52 s |
-| 4  | **359.1** | 301.4 | **50 ms** | 70 ms  | **1.39 s** | 2.05 s |
-| 16 | 392.1 | **738.8** (1.9×) | **148 ms** | 213 ms | 5.78 s | **2.41 s** |
-| 64 | 712.9 | **1487.2** (2.1×) | 5.36 s | **725 ms** | 9.85 s | **5.00 s** |
+| 1  | **124.9** | 116.2 | **24 ms** | 45 ms  | **1.04 s** | 1.47 s |
+| 4  | **346.3** | 295.7 | **49 ms** | 139 ms | **1.63 s** | 2.17 s |
+| 16 | 400.2 | **760.1** (1.9×) | **124 ms** | 209 ms | 5.60 s | **2.35 s** |
+| 64 | 750.6 | **1877.3** (2.5×) | 5.09 s | **675 ms** | 9.38 s | **4.01 s** |
 
 ([Tensorline](bench/results/vs_tensorline.json), [Ollama, 16 slots](bench/results/vs_ollama_p16.json).)
 Ollama (llama.cpp: C++ and hand-tuned CUDA, no Python on the hot path) is still ahead at 1–4
-streams, by 8% single-stream, down from 24% before the fused kernels below. Tensorline wins once
-batching matters: 1.9× at 16 and 2.1× at 64, with roughly half the p99 latency. Ollama queues
-everything beyond its fixed slots, while Tensorline's paged KV cache and iteration-level
-scheduler admit every request. Run-to-run variance on this laptop is real: across three runs
-the same day, Tensorline at concurrency 64 measured 1,014, 1,487 and 1,795 tok/s, and the table
-shows the full back-to-back run. vLLM is not compared: it does not support native Windows.
+streams, by 7% single-stream, down from 24% before the fused kernels below. Tensorline wins once
+batching matters: 1.9× at 16 and **2.5× at 64**, with less than half the p99 latency. Ollama
+queues everything beyond its fixed slots, while Tensorline's paged KV cache and
+iteration-level scheduler admit every request.
+
+> Methodology bug found and fixed: earlier runs of this comparison showed Tensorline swinging
+> between 1,014 and 1,795 tok/s at concurrency 64. The dashboard exposed the cause: a KV cache of
+> only 115 blocks. Killing `ollama.exe` leaves its `llama-server.exe` children alive, so orphans
+> from previous runs were holding about 4.7 GB of VRAM, and Tensorline sizes its KV cache from
+> *free* VRAM at startup. `run_vs_ollama.sh` now kills `llama-server` too, the GPU is verified
+> empty (6 MiB) before and after, and the engine warns when its KV cache cannot hold a modest
+> batch. The table above is from that clean run.
+vLLM is not compared: it does not support native Windows.
+
+### Dashboard
+
+`http://localhost:8000/` serves a live dashboard ([`tensorline/static/dashboard.html`](tensorline/static/dashboard.html),
+no external dependencies, light/dark). It shows tiles for output tok/s, the running batch and
+queue, KV-cache use, prefix-cache hit rate and windowed TTFT percentiles; 2-minute charts of
+throughput and batch size with hover readouts; a streaming chat playground that reports TTFT,
+tok/s and cached prompt tokens per reply; model load/unload controls in multi-model mode; and a
+load generator. The load generator runs inside the server (`POST /admin/burst`), because a
+browser page can only hold 6 connections to one site. A warm 64-request burst there completes
+8,192 tokens in 2.9 s (**2,783 tok/s**). The page reads `GET /api/stats`; Prometheus scrapes
+`GET /metrics`.
 
 ### Fused decode kernels
 

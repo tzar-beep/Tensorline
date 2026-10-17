@@ -88,6 +88,11 @@ class BatchEngine(Engine):
                 num_blocks = int(free * kv_mem_fraction) // per_block
             else:
                 num_blocks = (512 << 20) // per_block   # 512 MiB on CPU
+        if num_blocks * block_size < max_num_seqs * 256:
+            import warnings
+            warnings.warn(f"KV cache holds only {num_blocks * block_size} tokens ({num_blocks} blocks): "
+                          f"{max_num_seqs} concurrent sequences will queue or preempt. Free GPU memory "
+                          "(another process may be holding it) or pass --kv-cache-gb.", stacklevel=2)
         self.paged = PagedModel(self.model, num_blocks, block_size)
         self.alloc = BlockAllocator(num_blocks, prefix_caching)
         self.graphs = None

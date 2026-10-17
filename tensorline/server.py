@@ -12,7 +12,7 @@ import uuid
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .engine import Engine, GenStats, SamplingParams
@@ -22,6 +22,16 @@ from .manager import ModelManager, ModelSpec
 class Message(BaseModel):
     role: str
     content: str
+
+
+class BurstRequest(BaseModel):
+    n: int = 16
+    max_tokens: int = 128
+    model: Optional[str] = None
+
+
+BURST_TOPICS = ["hash maps", "TCP vs UDP", "Raft consensus", "paged attention", "B-trees",
+                "garbage collection", "TLS handshakes", "consistent hashing"]
 
 
 class ChatRequest(BaseModel):
@@ -62,6 +72,34 @@ def create_app(target: Engine | ModelManager) -> FastAPI:
             {"id": s["name"], "object": "model", "owned_by": "tensorline", "root": s["model_id"],
              "quant": s["quant"], "loaded": s["loaded"]} for s in manager.status()]}
 
+    @app.get("/", include_in_schema=False)
+    def dashboard():
+        return FileResponse(os.path.join(os.path.dirname(__file__), "static", "dashboard.html"))
+
+    @app.get("/api/stats")
+    def stats():
+        """Live engine state as JSON, for the dashboard (Prometheus scrapes /metrics)."""
+        engines = {}
+        for name, slot in manager.slots.items():
+            e = slot.engine
+            if e is None or not hasattr(e, "metrics"):
+                continue
+            m = e.metrics
+            engines[name] = {
+                "device": e.device, "quant": e.quant or "fp16", "weights_gb": e.weight_bytes / 2**30,
+                "running": len(e.running), "waiting": len(e.waiting),
+                "kv_total": e.alloc.num_blocks, "kv_free": e.alloc.num_free, "kv_cached": e.alloc.num_cached,
+                "steps": e.steps, "tokens_generated": m.tokens_generated, "preemptions": e.preemptions,
+                "prompt_tokens": e.prompt_tokens_total, "prefix_hit_tokens": e.prefix_hit_tokens,
+                "graph_replays": e.graphs.replays if e.graphs is not None else 0,
+                "finished": m.requests_finished,
+                "ttft": {"buckets": list(m.ttft.buckets), "counts": m.ttft.counts},
+                "latency": {"buckets": list(m.e2e.buckets), "counts": m.e2e.counts},
+            }
+        return {"time": time.time(), "multi_model": not single, "used_gb": manager.used_bytes() / 2**30,
+                "budget_gb": None if single else manager.budget / 2**30, "evictions": manager.evictions,
+                "models": manager.status(), "engines": engines}
+
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
         from .metrics import render
@@ -83,6 +121,37 @@ def create_app(target: Engine | ModelManager) -> FastAPI:
             return {"unloaded": await manager.unload(resolve(name))}
         except RuntimeError as e:
             raise HTTPException(409, str(e))
+
+    @app.post("/admin/burst")
+    async def burst(req: BurstRequest):
+        """Load generator inside the server: N concurrent generations, bypassing the browser's
+        6-connections-per-site limit so the dashboard can demo real batching."""
+        if not 1 <= req.n <= 256:
+            raise HTTPException(422, "n must be in [1, 256]")
+        name = resolve(req.model)
+        engine = await acquire(name)
+        if not hasattr(engine, "astream"):
+            await manager.release(name)
+            raise HTTPException(400, "burst needs the batch engine")
+
+        async def one(i: int):
+            prompt = engine.render_chat([{"role": "user", "content":
+                                          f"Request {i}: explain {BURST_TOPICS[i % len(BURST_TOPICS)]} in detail."}])
+            st, t0, ttft = GenStats(), time.perf_counter(), None
+            async for _ in engine.astream(prompt, SamplingParams(req.max_tokens), st):
+                ttft = ttft if ttft is not None else time.perf_counter() - t0
+            return ttft or 0.0, st.completion_tokens
+
+        try:
+            t0 = time.perf_counter()
+            res = await asyncio.gather(*(one(i) for i in range(req.n)))
+            wall = time.perf_counter() - t0
+        finally:
+            await manager.release(name)
+        ttfts = sorted(r[0] for r in res)
+        toks = sum(r[1] for r in res)
+        return {"n": req.n, "tokens": toks, "seconds": wall, "tok_s": toks / wall,
+                "ttft_p50_ms": 1000 * ttfts[len(ttfts) // 2], "ttft_max_ms": 1000 * ttfts[-1]}
 
     async def acquire(name: str):
         try:
