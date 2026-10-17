@@ -10,9 +10,9 @@ benchmark.
 > Status: **all five phases complete.** Everything below was measured on one RTX 3050 Laptop GPU (6 GB).
 
 **Highlights**
-- **2.5× Ollama's throughput** at 64 concurrent requests (1,877 vs 751 tok/s), with the same model and GPU, run back to back.
-- **80× over naive one-at-a-time serving** at peak (15.8 → 1,259 tok/s, back to back), through a paged KV cache, continuous batching and CUDA graphs; later optimisations reach 1,877 tok/s.
-- **Serves a 3B model that does not fit in VRAM at fp16** (728 tok/s), using hand-written fused int4/int8 Triton kernels (int8: lossless perplexity).
+- **3.2× Ollama's throughput at 64 concurrent requests** (2,487 vs 785 tok/s) and 2.7× at 16, with the same model and GPU, run back to back. Tensorline leads from 4 concurrent requests up and is within 3% single-stream.
+- **80× over naive one-at-a-time serving** at peak (15.8 → 1,259 tok/s, back to back), through a paged KV cache, continuous batching and CUDA graphs; later optimisations reach 2,487 tok/s.
+- **Serves a 3B model that does not fit in VRAM at fp16** (808 tok/s), using hand-written fused int4/int8 Triton kernels (int8: lossless perplexity).
 - **Correctness by differential testing**: the paged engine is token-identical to a reference engine under chunked prefill, preemption and prefix sharing; 70 tests (the CPU subset runs in CI; GPU tests run locally).
 
 ## Quickstart
@@ -91,16 +91,16 @@ tok/s at concurrency 16 ([raw](bench/results/vs_ollama.json)).
 
 | Concurrency | Ollama tok/s | **Tensorline tok/s** | Ollama TTFT p50 | **Tensorline TTFT p50** | Ollama latency p99 | **Tensorline latency p99** |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1  | **124.9** | 116.2 | **24 ms** | 45 ms  | **1.04 s** | 1.47 s |
-| 4  | **346.3** | 295.7 | **49 ms** | 139 ms | **1.63 s** | 2.17 s |
-| 16 | 400.2 | **760.1** (1.9×) | **124 ms** | 209 ms | 5.60 s | **2.35 s** |
-| 64 | 750.6 | **1877.3** (2.5×) | 5.09 s | **675 ms** | 9.38 s | **4.01 s** |
+| 1  | **124.2** | 120.0 | **24 ms** | 42 ms  | **1.05 s** | 1.08 s |
+| 4  | 340.2 | **381.9** (1.1×) | **46 ms** | 57 ms  | 1.64 s | **1.31 s** |
+| 16 | 407.7 | **1092.5** (2.7×) | **142 ms** | 164 ms | 5.46 s | **1.58 s** |
+| 64 | 785.1 | **2487.3** (3.2×) | 5.14 s | **577 ms** | 8.88 s | **2.93 s** |
 
 ([Tensorline](bench/results/vs_tensorline.json), [Ollama, 16 slots](bench/results/vs_ollama_p16.json).)
-Ollama (llama.cpp: C++ and hand-tuned CUDA, no Python on the hot path) is still ahead at 1–4
-streams, by 7% single-stream, down from 24% before the fused kernels below. Tensorline wins once
-batching matters: 1.9× at 16 and **2.5× at 64**, with less than half the p99 latency. Ollama
-queues everything beyond its fixed slots, while Tensorline's paged KV cache and
+Ollama (llama.cpp: C++ and hand-tuned CUDA, no Python on the hot path) keeps a 3% edge for a
+single stream, down from 24% before the kernel and scheduling work below. From 4 concurrent
+requests up, Tensorline leads: 2.7× at 16 and **3.2× at 64**, with a third of the p99 latency.
+Ollama queues everything beyond its fixed slots, while Tensorline's paged KV cache and
 iteration-level scheduler admit every request.
 
 > Methodology bug found and fixed: earlier runs of this comparison showed Tensorline swinging
@@ -109,7 +109,8 @@ iteration-level scheduler admit every request.
 > from previous runs were holding about 4.7 GB of VRAM, and Tensorline sizes its KV cache from
 > *free* VRAM at startup. `run_vs_ollama.sh` now kills `llama-server` too, the GPU is verified
 > empty (6 MiB) before and after, and the engine warns when its KV cache cannot hold a modest
-> batch. The table above is from that clean run.
+> batch. The table above is from a clean final run, after every optimisation in this README
+> (fused kernels, batched prefill, startup CUDA-graph capture).
 vLLM is not compared: it does not support native Windows.
 
 ### Dashboard
@@ -219,21 +220,21 @@ is now **1.16–1.50× faster** than fp16, and int8 1.22–1.47×.
 |---|---:|---:|---:|---:|
 | 0.5B | 1  | 92.8  | **108.7** | 104.3 |
 | 0.5B | 64 | **1628.6** | 1564.0 | 1362.4 |
-| 1.5B | 1  | 45.3  | **60.6** (+34%) | 60.2 |
-| 1.5B | 16 | 371.2 | **404.2** | 338.7 |
-| 1.5B | 64 | 1108.0 | **1155.1** | 1044.2 |
-| 3B | 1  | doesn't fit | 32.1 | **35.6** |
-| 3B | 16 | doesn't fit | **257.1** | 251.2 |
-| 3B | 64 | doesn't fit | **727.7** | 672.5 |
+| 1.5B | 1  | 46.0  | 64.8 | **68.2** (+48%) |
+| 1.5B | 16 | 445.6 | **590.7** (+33%) | 545.8 |
+| 1.5B | 64 | 1253.5 | **1416.5** (+13%) | 1177.8 |
+| 3B | 1  | doesn't fit | 33.0 | **38.3** |
+| 3B | 16 | doesn't fit | 327.9 | **354.8** |
+| 3B | 64 | doesn't fit | **807.9** | 749.7 |
 
-**Qwen2.5-3B does not fit in this 6 GB GPU at fp16; quantised, it serves at 728 tok/s.**
-Quantisation pays off most for single streams on larger models (+34% at 1.5B), where streaming
-the weights dominates each step. At high concurrency, int8 and int4 land within about 10% of
-each other: the step becomes more compute- and overhead-bound, and int4's extra unpacking offsets
-its smaller weights. int4's main win is memory (2.32 vs 3.17 GB at 3B), which leaves more KV
-cache or room for a second model. At 0.5B, the fp16 embedding/LM head (272 MB) is a large share
-of the bytes, so quantisation gains are small. (The 0.5B rows predate the latest kernel work; 1.5B
-and 3B were re-run after it.)
+**Qwen2.5-3B does not fit in this 6 GB GPU at fp16; quantised, it serves at 808 tok/s.**
+Quantisation helps most where streaming the weights dominates a step: single streams on larger
+models (+48% for int4 at 1.5B). At high concurrency, int8 is the best all-rounder (+13% over fp16
+at 1.5B, concurrency 64). int4 trails it there, because its nibble unpacking costs ALU work that
+small batches hide and large batches don't, but it uses less memory (2.32 vs 3.17 GB at 3B),
+which leaves more KV cache or room for a second model. At 0.5B, the fp16 embedding/LM head
+(272 MB) is a large share of the bytes, so gains are small. (The 0.5B rows predate the latest
+kernel work; the 1.5B and 3B rows are from the final run, with startup graph capture.)
 
 ### Multi-model serving (Phase 3)
 
