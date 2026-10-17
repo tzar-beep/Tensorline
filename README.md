@@ -113,8 +113,23 @@ throughput and batch size with hover readouts; a streaming chat playground that 
 tok/s and cached prompt tokens per reply; model load/unload controls in multi-model mode; and a
 load generator. The load generator runs inside the server (`POST /admin/burst`), because a
 browser page can only hold 6 connections to one site. A warm 64-request burst there completes
-8,192 tokens in 2.9 s (**2,783 tok/s**). The page reads `GET /api/stats`; Prometheus scrapes
+8,192 tokens in 2.56 s (**3,205 tok/s**, TTFT 562 ms for all 64). The page reads `GET /api/stats`; Prometheus scrapes
 `GET /metrics`.
+
+### Batched prefill attention
+
+When many prompts arrive at once, each fresh prompt used to get its own attention call per layer,
+plus a synchronous host-to-device copy of its block table inside the layer loop: 64 prompts ×
+24 layers = 1,536 tiny calls and copies. Fresh prompts attend only to their own new tokens, so
+their K/V are the tensors just computed, with no cache gather needed. They are now padded to the
+longest prompt and share **one** causal + key-padding-masked SDPA call per layer. Resumed chunks
+(chunked prefill, recompute after preemption) keep the per-sequence path, with all setup hoisted
+out of the layer loop.
+
+| 64 prompts arriving together (2,668 tokens) | Before | After |
+|---|---:|---:|
+| Prefill step, in-process | 680 ms | **171 ms** |
+| In-server burst: throughput / TTFT (warm) | 2,783 tok/s / 1,076 ms | **3,205 tok/s / 562 ms** |
 
 ### Fused decode kernels
 

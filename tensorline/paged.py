@@ -134,6 +134,12 @@ class PagedModel:
         elem = next(hf_model.parameters()).element_size()
         return 2 * cfg.num_hidden_layers * block_size * cfg.num_key_value_heads * a.head_dim * elem
 
+    def _expand_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """[P, L, n_kv, d] -> [P, n_heads, L, d], repeating each KV head for its query group."""
+        P, L = x.shape[:2]
+        x = x.permute(0, 2, 1, 3)[:, :, None].expand(P, self.n_kv, self.group, L, self.head_dim)
+        return x.reshape(P, self.n_heads, L, self.head_dim)
+
     def _expand_kv(self, x: torch.Tensor) -> torch.Tensor:
         """[ctx, n_kv, d] -> [1, n_heads, ctx, d], repeating each KV head for its query group."""
         ctx = x.shape[0]
@@ -196,6 +202,28 @@ class PagedModel:
             L = max_blocks * bs
             d_mask = (torch.arange(L, device=dev)[None, :] < d_lens[:, None])[:, None, None, :]
 
+        # Fresh prompts (start == 0) attend only to their own new tokens, whose K/V are the tensors
+        # computed this step, so there is no cache gather. They are padded to the longest one and
+        # share ONE masked SDPA call per layer (instead of one call per prompt).
+        fresh = [(r0, c) for r0, c in prefill if c.start == 0]
+        resumed = [(r0, c) for r0, c in prefill if c.start > 0]   # chunked prefill / recompute
+        if fresh:
+            P, Lp = len(fresh), max(len(c.token_ids) for _, c in fresh)
+            lens = torch.tensor([len(c.token_ids) for _, c in fresh], device=dev)
+            starts = torch.tensor([r0 for r0, _ in fresh], device=dev)
+            ar = torch.arange(Lp, device=dev)
+            valid = ar[None, :] < lens[:, None]                          # [P, Lp]
+            gidx = torch.where(valid, starts[:, None] + ar[None, :], 0)   # padded row -> any real row
+            f_mask = (ar[None, :] <= ar[:, None])[None] & valid[:, None, :]   # causal & real keys
+            f_mask = f_mask[:, None]                                     # [P, 1, Lp, Lp]
+            f_rows = gidx[valid]                                         # output rows, in order
+        r_meta = []
+        for r0, c in resumed:                                            # hoisted out of the layer loop
+            n, ctx = len(c.token_ids), c.start + len(c.token_ids)
+            bt = torch.tensor(c.block_table[:(ctx + bs - 1) // bs], device=dev)
+            m = (torch.arange(ctx, device=dev)[None, :] <= (c.start + torch.arange(n, device=dev))[:, None])
+            r_meta.append((r0, n, ctx, bt, m))
+
         x = self.inner.embed_tokens(ids_t)                       # [T, H]
         cos, sin = self.inner.rotary_emb(x[None], pos_t[None])    # [1, T, d]
         cos, sin = cos[0].contiguous(), sin[0].contiguous()
@@ -223,19 +251,17 @@ class PagedModel:
                 qd = q[d_idx].view(B, self.n_kv, self.group, self.head_dim)
                 od = F.scaled_dot_product_attention(qd, kd, vd, attn_mask=d_mask, scale=self.scale)
                 o[d_idx] = od.reshape(B, self.n_heads, self.head_dim)
-            for row0, c in prefill:
-                n, ctx = len(c.token_ids), c.start + len(c.token_ids)
-                nb = (ctx + bs - 1) // bs
-                bt = torch.tensor(c.block_table[:nb], device=dev)
+            if fresh:
+                qf = q[gidx].transpose(1, 2)                                   # [P, nh, Lp, d]
+                kf = self._expand_heads(k[gidx])
+                vf = self._expand_heads(v[gidx])
+                of = F.scaled_dot_product_attention(qf, kf, vf, attn_mask=f_mask, scale=self.scale)
+                o[f_rows] = of.transpose(1, 2)[valid]
+            for row0, n, ctx, bt, m in r_meta:    # query i sees cached keys <= start + i
                 kp = self._expand_kv(kc[bt].view(-1, self.n_kv, self.head_dim)[:ctx])
                 vp = self._expand_kv(vc[bt].view(-1, self.n_kv, self.head_dim)[:ctx])
                 qp = q[row0:row0 + n].transpose(0, 1)[None]      # [1, nh, n, d]
-                if c.start == 0:
-                    op = F.scaled_dot_product_attention(qp, kp, vp, is_causal=True, scale=self.scale)
-                else:  # chunked prefill / recompute: query i sees keys <= start + i
-                    m = (torch.arange(ctx, device=dev)[None, :]
-                         <= (c.start + torch.arange(n, device=dev))[:, None])
-                    op = F.scaled_dot_product_attention(qp, kp, vp, attn_mask=m, scale=self.scale)
+                op = F.scaled_dot_product_attention(qp, kp, vp, attn_mask=m, scale=self.scale)
                 o[row0:row0 + n] = op[0].transpose(0, 1)
             h = add_rmsnorm(x, attn.o_proj(o.reshape(T, -1)), layer.post_attention_layernorm)
             pending = layer.mlp(h)
