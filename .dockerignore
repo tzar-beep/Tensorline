@@ -1,0 +1,4 @@
+.venv
+.git
+bench/results/*.log
+__pycache__

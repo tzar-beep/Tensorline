@@ -1,0 +1,28 @@
+{
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "window": 1024,
+  "dataset": "wikitext-2-raw-v1/test",
+  "results": [
+    {
+      "quant": "int8",
+      "ppl": 9.591194761479578,
+      "weights_gb": 3.165947437286377,
+      "tokens": 298938,
+      "seconds": 2165.3195286000046
+    },
+    {
+      "quant": "int4",
+      "ppl": 10.464920536052723,
+      "weights_gb": 2.3154854774475098,
+      "tokens": 298938,
+      "seconds": 553.6262367000018
+    },
+    {
+      "quant": "int4-all",
+      "ppl": 11.485175534728139,
+      "weights_gb": 1.952782154083252,
+      "tokens": 298938,
+      "seconds": 476.00685469999735
+    }
+  ]
+}

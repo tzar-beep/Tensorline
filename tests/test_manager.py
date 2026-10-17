@@ -113,3 +113,18 @@ def test_unload_returns_vram_and_estimate_matches_measurement():
                 assert torch.cuda.memory_allocated() - base < (64 << 20), (cycle, s.name)
 
     asyncio.run(scenario())
+
+
+def test_metrics_endpoint_reports_engine_activity():
+    eng = cpu_factory(ModelSpec("m", TINY))
+    c = TestClient(create_app(eng))
+    for _ in range(3):
+        c.post("/v1/chat/completions", json={"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})
+    text = c.get("/metrics").text
+    vals = {l.rsplit(" ", 1)[0]: float(l.rsplit(" ", 1)[1]) for l in text.splitlines() if l and not l.startswith("#")}
+    m = 'model="' + TINY + '"'
+    assert vals[f"tensorline_generation_tokens_total{{{m}}}"] > 0
+    assert vals[f'tensorline_time_to_first_token_seconds_count{{{m}}}'] == 3
+    assert vals[f'tensorline_time_to_first_token_seconds_bucket{{{m},le="+Inf"}}'] == 3
+    assert vals[f"tensorline_kv_blocks_free{{{m}}}"] == vals[f"tensorline_kv_blocks_total{{{m}}}"]
+    assert vals[f"tensorline_prefix_cache_hit_tokens_total{{{m}}}"] > 0     # same prompt 3x

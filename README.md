@@ -5,7 +5,7 @@ models behind an OpenAI-compatible API, and is built up phase by phase toward co
 a paged KV cache, quantisation and multi-model serving, with every claim backed by a reproducible
 benchmark.
 
-> Status: **Phase 3 in progress** (quantisation + multi-model done; 3B results pending). **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, CUDA-graph decode and automatic prefix caching.
+> Status: **Phases 1–3 and 5 complete**; Phase 4's comparison against Ollama/vLLM is pending. **Phase 2 complete**: continuous batching over a paged KV cache, chunked prefill, preemption, CUDA-graph decode and automatic prefix caching.
 
 ## Quickstart
 
@@ -31,6 +31,8 @@ Model: Qwen2.5-0.5B-Instruct, fp16, greedy, 128 max output tokens. Harness: [`be
 (streaming clients, works against any OpenAI-compatible server). Raw results live in `bench/results/`.
 
 ### Naive vs continuous batching vs batching + CUDA graphs
+
+![Output throughput vs concurrent requests](docs/throughput.svg)
 
 All three engines were run back to back by [`bench/run_compare.sh`](bench/run_compare.sh) in the
 same machine state. Each level sends max(16, 2 × concurrency) streaming requests with 128 output
@@ -116,6 +118,7 @@ with a deterministic reduction keeps the GPU busy. `int4` is mixed precision: `v
 |---|---:|---:|---:|---:|---|
 | Qwen2.5-0.5B | 15.949 | 15.932 (−0.1%) | 17.413 (+9.2%) | 19.580 (+22.8%) | 0.92 → 0.59 → 0.48 GB |
 | Qwen2.5-1.5B | 10.699 | 10.729 (+0.3%) | 11.451 (+7.0%) | 12.092 (+13.0%) | 2.88 → 1.66 → 1.26 GB |
+| Qwen2.5-3B | does not fit (6.2 GB) | 9.591 | 10.465 (+9.1% vs int8) | 11.485 (+19.7% vs int8) | — → 3.17 → 2.32 GB |
 
 The int4 ablation on 0.5B: group size 64 gives 19.15, group 32 gives 17.79, and keeping only
 `down_proj` in int8 gives 18.29. Keeping both `v_proj` and `down_proj` in int8 (17.41) wins and
@@ -135,7 +138,12 @@ a known limitation and next on the list.
 | 1.5B | 1  | 41.9  | 52.1 | **54.4** (+30%) |
 | 1.5B | 16 | 321.4 | **352.1** | 321.5 |
 | 1.5B | 64 | 857.7 | **987.5** (+15%) | 766.5 |
+| 3B | 1  | doesn't fit | 20.9 | **31.1** (+49%) |
+| 3B | 16 | doesn't fit | 105.9 | **183.8** (+74%) |
+| 3B | 64 | doesn't fit | 352.2 | **462.3** (+31%) |
 
+**Qwen2.5-3B does not fit in this 6 GB GPU at fp16; quantised, it serves at 462 tok/s**. At 3B,
+int4 beats int8 at every concurrency, because the weights dominate memory traffic.
 Quantisation pays off for single streams and larger models, where weight streaming dominates.
 At 0.5B, the fp16 embedding/LM head (272 MB) is a large share of the bytes, so the gains are
 small. int4 at high concurrency is held back by the M = 64 kernel limitation above.
@@ -228,6 +236,16 @@ client ──HTTP/SSE──▶ FastAPI (asyncio) ──▶ request thread ──
   sequence writes K/V only past its fully computed prefix. A fully cached prompt recomputes its
   last block to obtain logits. Responses report `usage.prompt_tokens_details.cached_tokens`,
   matching the OpenAI API.
+
+- **Observability** ([`tensorline/metrics.py`](tensorline/metrics.py)): `GET /metrics` serves
+  Prometheus text format with no client library. Per model it reports running/waiting
+  sequences, KV blocks (total/free/cached), steps, preemptions, generated and prompt tokens,
+  prefix-cache hits, CUDA-graph replays, finish reasons, histograms of TTFT, request latency
+  and batch size, plus model residency, memory and evictions.
+- **Deployment**: a [`Dockerfile`](Dockerfile) on the CUDA runtime image
+  (`docker run --gpus all -p 8000:8000 tensorline --model ... --quant int4`), and a CI workflow
+  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that runs the CPU test suite on every
+  push; GPU tests skip themselves there.
 
 ### Testing
 

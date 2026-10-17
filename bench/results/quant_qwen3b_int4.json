@@ -1,0 +1,44 @@
+{
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "url": "http://127.0.0.1:8000",
+  "max_tokens": 128,
+  "shared_prefix_words": 0,
+  "results": [
+    {
+      "concurrency": 1,
+      "requests": 16,
+      "ttft_p50_ms": 183.87579999989612,
+      "ttft_p99_ms": 3267.656700000316,
+      "lat_p50_s": 3.6496541000001343,
+      "lat_p99_s": 7.373637500000314,
+      "throughput_tok_s": 31.14749363228942,
+      "per_req_tok_s": 31.21534467921753,
+      "prompt_tokens_mean": 38.5,
+      "cached_prompt_frac": 0.7792207792207793
+    },
+    {
+      "concurrency": 16,
+      "requests": 32,
+      "ttft_p50_ms": 950.670799999898,
+      "ttft_p99_ms": 1101.5531000002738,
+      "lat_p50_s": 6.186247300000105,
+      "lat_p99_s": 10.30020949999971,
+      "throughput_tok_s": 183.78828930628285,
+      "per_req_tok_s": 13.922569373427784,
+      "prompt_tokens_mean": 38.5,
+      "cached_prompt_frac": 0.8311688311688312
+    },
+    {
+      "concurrency": 64,
+      "requests": 128,
+      "ttft_p50_ms": 1687.7254000000903,
+      "ttft_p99_ms": 2881.5395000001445,
+      "lat_p50_s": 11.828755800000181,
+      "lat_p99_s": 17.220615599999746,
+      "throughput_tok_s": 462.30948348060105,
+      "per_req_tok_s": 8.227275407870113,
+      "prompt_tokens_mean": 38.5,
+      "cached_prompt_frac": 0.8311688311688312
+    }
+  ]
+}

@@ -12,7 +12,7 @@ import uuid
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .engine import Engine, GenStats, SamplingParams
@@ -61,6 +61,11 @@ def create_app(target: Engine | ModelManager) -> FastAPI:
         return {"object": "list", "data": [
             {"id": s["name"], "object": "model", "owned_by": "tensorline", "root": s["model_id"],
              "quant": s["quant"], "loaded": s["loaded"]} for s in manager.status()]}
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    def metrics():
+        from .metrics import render
+        return PlainTextResponse(render(manager), media_type="text/plain; version=0.0.4")
 
     @app.get("/admin/models")
     def admin_models():

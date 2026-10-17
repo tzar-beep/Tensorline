@@ -32,6 +32,7 @@ import torch
 
 from .detok import IncrementalDetokenizer
 from .engine import Engine, GenStats, SamplingParams, sample
+from .metrics import EngineMetrics
 from .paged import BlockAllocator, PagedModel, SeqChunk, block_hash
 
 
@@ -107,6 +108,7 @@ class BatchEngine(Engine):
         self.max_running_seen = 0
         self.prompt_tokens_total = 0
         self.prefix_hit_tokens = 0
+        self.metrics = EngineMetrics()
         self._pending: list[tuple[_Sink, object]] = []   # outputs produced during this step
         self._aborted: list[Sequence] = []
         self._stop = False
@@ -277,6 +279,7 @@ class BatchEngine(Engine):
                 continue              # already finished
             self._release(seq)
             seq.stats.finish_reason = "abort"
+            self.metrics.requests_finished["abort"] = self.metrics.requests_finished.get("abort", 0) + 1
         self._aborted.clear()
 
     def _schedule(self) -> list[tuple[Sequence, int]]:
@@ -327,6 +330,8 @@ class BatchEngine(Engine):
         seq.stats.finish_reason = reason
         seq.stats.completion_tokens = seq.num_generated
         seq.stats.total_s = time.perf_counter() - seq.t_submit
+        self.metrics.e2e.observe(seq.stats.total_s)
+        self.metrics.requests_finished[reason] = self.metrics.requests_finished.get(reason, 0) + 1
         self.running.remove(seq)
         self._release(seq)
         self._emit(seq, None)
@@ -345,6 +350,7 @@ class BatchEngine(Engine):
             logits = self.paged.forward(chunks)     # prefill / mixed step: eager
         self.steps += 1
         self.max_running_seen = max(self.max_running_seen, len(self.running))
+        self.metrics.batch.observe(len(plan))
 
         sampled = [s for (s, _), c in zip(plan, chunks) if c.want_logits]
         greedy = logits.argmax(dim=-1).tolist() if sampled else []
@@ -356,10 +362,12 @@ class BatchEngine(Engine):
             tok = greedy[i] if seq.params.temperature <= 0 else sample(logits[i], seq.params)
             if seq.num_generated == 0:
                 seq.stats.ttft_s = now - seq.t_submit
+                self.metrics.ttft.observe(seq.stats.ttft_s)
             if tok in seq.stops:
                 self._finish(seq, "stop")
                 continue
             seq.tokens.append(tok)
+            self.metrics.tokens_generated += 1
             self._emit(seq, tok)
             if seq.num_generated >= seq.params.max_tokens or len(seq.tokens) >= self.max_model_len:
                 self._finish(seq, "length")
