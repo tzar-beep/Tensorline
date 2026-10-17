@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tensorline vs Ollama on the same GPU, same model (Qwen2.5-0.5B-Instruct fp16), same client, back to back.
-# Ollama is tuned for concurrency: 64 parallel slots, 512-token context per slot, flash attention.
+# Ollama is tuned for concurrency: 16 parallel slots (beat 64 in testing), 512-token context per slot, flash attention.
 set -e
 PY=${PY:-.venv/Scripts/python.exe}
 OLLAMA=${OLLAMA:-"$LOCALAPPDATA/Programs/Ollama/ollama.exe"}
@@ -16,9 +16,9 @@ $PY bench/bench.py --concurrency $LEVELS --requests 16 --out bench/results/vs_te
 kill $pid; wait $pid 2>/dev/null || true
 
 echo "== ollama =="
-OLLAMA_NUM_PARALLEL=64 OLLAMA_CONTEXT_LENGTH=512 OLLAMA_FLASH_ATTENTION=1 OLLAMA_KEEP_ALIVE=30m \
+OLLAMA_NUM_PARALLEL=16 OLLAMA_CONTEXT_LENGTH=512 OLLAMA_FLASH_ATTENTION=1 OLLAMA_KEEP_ALIVE=30m \
   "$OLLAMA" serve > bench/results/server_vs_ollama.log 2>&1 &
 until curl -sf localhost:11434/api/version > /dev/null; do sleep 1; done
 $PY bench/bench.py --url http://127.0.0.1:11434 --model qwen2.5:0.5b-instruct-fp16 \
-  --concurrency $LEVELS --requests 16 --out bench/results/vs_ollama.json
+  --concurrency $LEVELS --requests 16 --out bench/results/vs_ollama_p16.json
 "$PY" -c "import subprocess; subprocess.run(['taskkill','/F','/IM','ollama.exe'], capture_output=True)"

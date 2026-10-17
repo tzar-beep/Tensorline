@@ -97,7 +97,10 @@ class ModelManager:
         spec = ModelSpec(name or engine.model_id, engine.model_id, getattr(engine, "quant", None))
         m = cls([spec], budget_bytes=1 << 62, engine_factory=lambda s: engine)
         slot = m.slots[spec.name]
-        slot.engine, slot.last_used = engine, time.monotonic()
+        slot.engine, slot.last_used, slot.loads = engine, time.monotonic(), 1
+        kv = getattr(engine, "paged", None)
+        kv_bytes = sum(t.numel() * t.element_size() for t in kv.k_cache + kv.v_cache) if kv else 0
+        slot.footprint = getattr(engine, "weight_bytes", 0) + kv_bytes
         return m
 
     @staticmethod

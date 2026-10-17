@@ -21,6 +21,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from .fused import add_rmsnorm, rope_
+
 
 class BlockAllocator:
     """Ref-counted KV block allocator with automatic prefix caching.
@@ -103,11 +105,6 @@ class SeqChunk:
     want_logits: bool       # True if the last token of this chunk should be sampled from
 
 
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
 class PagedModel:
     def __init__(self, hf_model, num_blocks: int, block_size: int = 16):
         self.hf = hf_model
@@ -152,24 +149,24 @@ class PagedModel:
         mask = (torch.arange(L, device=ids.device)[None, :] < lens[:, None])[:, None, None, :]
         x = self.inner.embed_tokens(ids)
         cos, sin = self.inner.rotary_emb(x[None], pos[None])
-        cos, sin = cos[0][:, None, :], sin[0][:, None, :]
+        cos, sin = cos[0].contiguous(), sin[0].contiguous()
+        pending = None                    # previous sub-block's output, folded into the next norm
         for layer, kc, vc in zip(self.inner.layers, self.k_cache, self.v_cache):
             attn = layer.self_attn
-            h = layer.input_layernorm(x)
+            h = add_rmsnorm(x, pending, layer.input_layernorm)      # x += pending; h = norm(x)
             q = attn.q_proj(h).view(B, self.n_heads, self.head_dim)
             k = attn.k_proj(h).view(B, self.n_kv, self.head_dim)
             v = attn.v_proj(h).view(B, self.n_kv, self.head_dim)
-            q = q * cos + rotate_half(q) * sin
-            k = k * cos + rotate_half(k) * sin
+            rope_(q, k, cos, sin)
             kc.view(-1, self.n_kv, self.head_dim).index_copy_(0, slots, k)
             vc.view(-1, self.n_kv, self.head_dim).index_copy_(0, slots, v)
             kd = kc[tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
             vd = vc[tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
             qd = q.view(B, self.n_kv, self.group, self.head_dim)
             od = F.scaled_dot_product_attention(qd, kd, vd, attn_mask=mask, scale=self.scale)
-            x = x + attn.o_proj(od.reshape(B, -1))
-            x = x + layer.mlp(layer.post_attention_layernorm(x))
-        return self.hf.lm_head(self.inner.norm(x))
+            h = add_rmsnorm(x, attn.o_proj(od.reshape(B, -1)), layer.post_attention_layernorm)
+            pending = layer.mlp(h)
+        return self.hf.lm_head(add_rmsnorm(x, pending, self.inner.norm))
 
     @torch.inference_mode()
     def forward(self, chunks: list[SeqChunk]) -> torch.Tensor:
@@ -201,16 +198,16 @@ class PagedModel:
 
         x = self.inner.embed_tokens(ids_t)                       # [T, H]
         cos, sin = self.inner.rotary_emb(x[None], pos_t[None])    # [1, T, d]
-        cos, sin = cos[0][:, None, :], sin[0][:, None, :]
+        cos, sin = cos[0].contiguous(), sin[0].contiguous()
+        pending = None                    # previous sub-block's output, folded into the next norm
 
         for layer, kc, vc in zip(self.inner.layers, self.k_cache, self.v_cache):
             attn = layer.self_attn
-            h = layer.input_layernorm(x)
+            h = add_rmsnorm(x, pending, layer.input_layernorm)      # x += pending; h = norm(x)
             q = attn.q_proj(h).view(T, self.n_heads, self.head_dim)
             k = attn.k_proj(h).view(T, self.n_kv, self.head_dim)
             v = attn.v_proj(h).view(T, self.n_kv, self.head_dim)
-            q = q * cos + rotate_half(q) * sin
-            k = k * cos + rotate_half(k) * sin
+            rope_(q, k, cos, sin)
             kc.view(-1, self.n_kv, self.head_dim)[slots_t] = k
             vc.view(-1, self.n_kv, self.head_dim)[slots_t] = v
 
@@ -240,8 +237,8 @@ class PagedModel:
                          <= (c.start + torch.arange(n, device=dev))[:, None])
                     op = F.scaled_dot_product_attention(qp, kp, vp, attn_mask=m, scale=self.scale)
                 o[row0:row0 + n] = op[0].transpose(0, 1)
-            x = x + attn.o_proj(o.reshape(T, -1))
-            x = x + layer.mlp(layer.post_attention_layernorm(x))
+            h = add_rmsnorm(x, attn.o_proj(o.reshape(T, -1)), layer.post_attention_layernorm)
+            pending = layer.mlp(h)
 
         rows, r = [], 0
         for c in chunks:
@@ -250,5 +247,6 @@ class PagedModel:
                 rows.append(r - 1)
         if not rows:
             return torch.empty(0, device=dev)
-        h = self.inner.norm(x[torch.tensor(rows, device=dev)])
+        r = torch.tensor(rows, device=dev)
+        h = add_rmsnorm(x[r], pending[r], self.inner.norm)
         return self.hf.lm_head(h)

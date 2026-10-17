@@ -95,3 +95,29 @@ def test_quantized_engine_graphs_match_eager(mode):
         del eng
         torch.cuda.empty_cache()
     assert out[True] == out[False]
+
+
+@gpu
+@pytest.mark.parametrize("T", [1, 5, 64])
+def test_fused_add_rmsnorm_and_rope_match_reference(T):
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+    from tensorline.fused import _rotate_half, add_rmsnorm, rope_
+    torch.manual_seed(0)
+    norm = Qwen2RMSNorm(896, eps=1e-6).cuda().half()
+    norm.weight.data.uniform_(0.5, 1.5)
+    x, r = (torch.randn(T, 896, device="cuda", dtype=torch.float16) for _ in range(2))
+    want_x = x + r
+    want = norm(want_x)
+    got = add_rmsnorm(x, r, norm)                          # x updated in place
+    torch.testing.assert_close(x, want_x)
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+    q = torch.randn(T, 14, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(T, 2, 64, device="cuda", dtype=torch.float16)
+    ang = torch.rand(T, 32, device="cuda") * 6
+    cos = torch.cat([ang.cos(), ang.cos()], -1).half()
+    sin = torch.cat([ang.sin(), ang.sin()], -1).half()
+    wq = q * cos[:, None] + _rotate_half(q) * sin[:, None]
+    wk = k * cos[:, None] + _rotate_half(k) * sin[:, None]
+    rope_(q, k, cos, sin)
+    torch.testing.assert_close(q, wq, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(k, wk, atol=4e-3, rtol=4e-3)

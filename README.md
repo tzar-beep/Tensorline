@@ -75,28 +75,42 @@ What the numbers show:
 ### vs Ollama (Phase 4)
 
 Both servers run the same model, Qwen2.5-0.5B-Instruct fp16, on the same GPU with the same
-client (`bench/bench.py`, OpenAI API, streaming, 128 output tokens). The run used
-[`bench/run_vs_ollama.sh`](bench/run_vs_ollama.sh) with Ollama 0.35.1, all layers on the GPU,
-flash attention on, and a 512-token context per slot. Ollama was tried with 64 and with 16
-parallel slots, and the better config (16) is shown. With 64 slots, llama-server spends its time
-saving idle slots to its host-side prompt cache and collapses to 94 tok/s at concurrency 16
-([raw](bench/results/vs_ollama.json)).
+client (`bench/bench.py`, OpenAI API, streaming, 128 output tokens), back to back via
+[`bench/run_vs_ollama.sh`](bench/run_vs_ollama.sh). Ollama 0.35.1 runs with all layers on the GPU,
+flash attention, a 512-token context per slot, and 16 parallel slots. With 64 slots, its
+llama-server spends its time saving idle slots to a host-side prompt cache and collapses to 94
+tok/s at concurrency 16 ([raw](bench/results/vs_ollama.json)).
 
 | Concurrency | Ollama tok/s | **Tensorline tok/s** | Ollama TTFT p50 | **Tensorline TTFT p50** | Ollama latency p99 | **Tensorline latency p99** |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1  | **121.1** | 91.7  | **27 ms** | 84 ms   | **1.06 s** | 1.96 s |
-| 4  | **312.3** | 231.5 | **55 ms** | 128 ms  | **1.86 s** | 2.73 s |
-| 16 | 433.4 | **623.4** (1.4×) | **162 ms** | 251 ms | 4.94 s | **2.81 s** |
-| 64 | 721.2 | **1597.0** (2.2×) | 5.13 s | **724 ms** | 9.85 s | **4.79 s** |
+| 1  | **121.9** | 112.0 | **26 ms** | 45 ms  | **1.06 s** | 1.52 s |
+| 4  | **359.1** | 301.4 | **50 ms** | 70 ms  | **1.39 s** | 2.05 s |
+| 16 | 392.1 | **738.8** (1.9×) | **148 ms** | 213 ms | 5.78 s | **2.41 s** |
+| 64 | 712.9 | **1487.2** (2.1×) | 5.36 s | **725 ms** | 9.85 s | **5.00 s** |
 
 ([Tensorline](bench/results/vs_tensorline.json), [Ollama, 16 slots](bench/results/vs_ollama_p16.json).)
-Ollama (llama.cpp: C++ and hand-tuned CUDA, no Python on the hot path) is faster at low
-concurrency, about 1.3× at 1–4 streams. Tensorline wins once batching matters: 1.4× the
-throughput at 16 and 2.2× at 64, with half the p99 latency. At 64 concurrent requests, Ollama
-queues everything beyond its fixed 16 slots, while Tensorline's paged KV cache and
-iteration-level scheduler admit all of them. The remaining gap at low concurrency is the ~7 ms of
-Python per step identified above. The two systems ran minutes apart in one session, not strictly
-interleaved. vLLM is not compared: it does not support native Windows.
+Ollama (llama.cpp: C++ and hand-tuned CUDA, no Python on the hot path) is still ahead at 1–4
+streams, by 8% single-stream, down from 24% before the fused kernels below. Tensorline wins once
+batching matters: 1.9× at 16 and 2.1× at 64, with roughly half the p99 latency. Ollama queues
+everything beyond its fixed slots, while Tensorline's paged KV cache and iteration-level
+scheduler admit every request. Run-to-run variance on this laptop is real: across three runs
+the same day, Tensorline at concurrency 64 measured 1,014, 1,487 and 1,795 tok/s, and the table
+shows the full back-to-back run. vLLM is not compared: it does not support native Windows.
+
+### Fused decode kernels
+
+Timing each component inside a CUDA graph showed that a batch-1 decode step (8.87 ms of GPU
+time; streaming the weights alone would take 6.6 ms) spent about 1.4 ms on launch-bound
+elementwise work. Hugging Face's RMSNorm is 7 kernels × 48 norms, and rotate-half RoPE is about
+12 kernels per layer. [`tensorline/fused.py`](tensorline/fused.py) replaces each residual-add +
+RMSNorm with one Triton kernel and each layer's q/k RoPE with one in-place kernel:
+
+| Decode step (in-process) | Before | After |
+|---|---:|---:|
+| GPU time, batch 1 (graph) | 8.87 ms | **7.65 ms** |
+| Step incl. sampling, batch 1 (graph) | 11.0 ms | **8.4 ms** |
+| Step incl. sampling, batch 64 (graph) | 20.1 ms | **16.5 ms** |
+| Step, batch 64 (eager, used for prefill steps) | 63.7 ms | **39.3 ms** |
 
 ### Host-side path: thread-free streaming
 
