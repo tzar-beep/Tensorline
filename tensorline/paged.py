@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from . import paged_attn
 from .fused import add_rmsnorm, rope_
 
 
@@ -120,6 +121,7 @@ class PagedModel:
         self.num_blocks = num_blocks
         p = next(hf_model.parameters())
         self.device, self.dtype = p.device, p.dtype
+        self.fast_attn = paged_attn.available() and self.device.type == "cuda"
         # One extra block past the allocator's range: a scratch sink for the K/V writes of
         # padding rows in fixed-shape (CUDA-graph) batches. It is never part of a real sequence.
         self.scratch_block = num_blocks
@@ -133,6 +135,20 @@ class PagedModel:
         a = hf_model.model.layers[0].self_attn
         elem = next(hf_model.parameters()).element_size()
         return 2 * cfg.num_hidden_layers * block_size * cfg.num_key_value_heads * a.head_dim * elem
+
+    def _decode_attn(self, q, kc, vc, tables, lens, mask) -> torch.Tensor:
+        """One query token per sequence -> [B, n_heads, d]. On CUDA: the Triton paged kernel reads
+        K/V blocks in place. Otherwise: gather into a padded buffer + SDPA, folding each KV head's
+        query group into SDPA's query axis (GQA without copying K/V)."""
+        if self.fast_attn:
+            return paged_attn.paged_decode(q, kc, vc, tables, lens, self.scale)
+        B, NB = tables.shape
+        L = NB * self.block_size
+        kd = kc[tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
+        vd = vc[tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
+        qd = q.view(B, self.n_kv, self.group, self.head_dim)
+        od = F.scaled_dot_product_attention(qd, kd, vd, attn_mask=mask, scale=self.scale)
+        return od.reshape(B, self.n_heads, self.head_dim)
 
     def _expand_heads(self, x: torch.Tensor) -> torch.Tensor:
         """[P, L, n_kv, d] -> [P, n_heads, L, d], repeating each KV head for its query group."""
@@ -166,10 +182,7 @@ class PagedModel:
             rope_(q, k, cos, sin)
             kc.view(-1, self.n_kv, self.head_dim).index_copy_(0, slots, k)
             vc.view(-1, self.n_kv, self.head_dim).index_copy_(0, slots, v)
-            kd = kc[tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
-            vd = vc[tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
-            qd = q.view(B, self.n_kv, self.group, self.head_dim)
-            od = F.scaled_dot_product_attention(qd, kd, vd, attn_mask=mask, scale=self.scale)
+            od = self._decode_attn(q, kc, vc, tables, lens, mask)
             h = add_rmsnorm(x, attn.o_proj(od.reshape(B, -1)), layer.post_attention_layernorm)
             pending = layer.mlp(h)
         return self.hf.lm_head(add_rmsnorm(x, pending, self.inner.norm))
@@ -246,11 +259,7 @@ class PagedModel:
                 # axis: q [B, n_kv, group, d] against k [B, n_kv, L, d]. (Passing enable_gqa
                 # with a mask instead drops SDPA to its slow math kernel.)
                 B = len(decode_rows)
-                kd = kc[d_tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
-                vd = vc[d_tables].view(B, L, self.n_kv, self.head_dim).transpose(1, 2)
-                qd = q[d_idx].view(B, self.n_kv, self.group, self.head_dim)
-                od = F.scaled_dot_product_attention(qd, kd, vd, attn_mask=d_mask, scale=self.scale)
-                o[d_idx] = od.reshape(B, self.n_heads, self.head_dim)
+                o[d_idx] = self._decode_attn(q[d_idx], kc, vc, d_tables, d_lens, d_mask)
             if fresh:
                 qf = q[gidx].transpose(1, 2)                                   # [P, nh, Lp, d]
                 kf = self._expand_heads(k[gidx])

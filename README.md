@@ -140,6 +140,22 @@ out of the layer loop.
 | Prefill step, in-process | 680 ms | **171 ms** |
 | In-server burst: throughput / TTFT (warm) | 2,783 tok/s / 1,076 ms | **3,205 tok/s / 562 ms** |
 
+### Paged-attention decode kernel
+
+Decode attention used to gather each sequence's whole KV history into a padded buffer
+(`kc[block_tables]`) and then run SDPA with a length mask. That costs memory traffic proportional
+to the *padded bucket* (up to 2× the real context) and copies the KV cache on every step, which
+grows with context length and batch size.
+[`tensorline/paged_attn.py`](tensorline/paged_attn.py) is a Triton kernel that walks each
+sequence's block table and reads K/V blocks in place, stopping exactly at the sequence length.
+One program per (sequence, KV head) serves all of that head's GQA query heads with a single
+`tl.dot` and an online softmax over 64-token tiles. It reads only device tensors, so it runs
+inside the CUDA-graph decode step. It is verified against the gather + SDPA reference (16 cases:
+lengths at block and tile boundaries up to 1,400 tokens, scattered block tables, GQA 14:2, 12:2
+and 16:2, and MHA), and every engine-level test now runs through it. Its speed is still to be
+measured: a long-context benchmark (unique ~850-token prompts, 512 output tokens) is the next
+measurement, since short-context runs barely exercise attention.
+
 ### Fused decode kernels
 
 Timing each component inside a CUDA graph showed that a batch-1 decode step (8.87 ms of GPU
@@ -386,8 +402,8 @@ Each phase shipped finished and demoable, with benchmark numbers, before the nex
    Actions CI, and README charts.
 
 **Possible next steps:** an overlap scheduler (build step t+1's inputs while step t's graph runs,
-hiding the remaining host time per step), speculative decoding, and a C++/CUDA paged-attention
-kernel to replace the gather + SDPA decode path.
+hiding the remaining host time per step), speculative decoding, and split-K (FlashDecoding-style) parallelism
+in the paged-attention kernel for long contexts at small batch sizes.
 
 ## Stack: what and why
 
