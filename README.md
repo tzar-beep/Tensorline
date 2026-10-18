@@ -162,6 +162,30 @@ out of the layer loop.
 | Prefill step, in-process | 680 ms | **171 ms** |
 | In-server burst: throughput / TTFT (warm) | 2,783 tok/s / 1,076 ms | **3,205 tok/s / 562 ms** |
 
+### Speculative decoding (prompt lookup)
+
+`--spec-tokens K` (server default 4). There is no draft model: if the last 3 tokens occurred
+earlier in the context, the tokens that followed them become the draft (an incremental n-gram
+index makes this O(1)). Verification needs **no new kernel and no extra launch**. Each draft
+token becomes one more row of the ordinary CUDA-graph decode batch, at its own position with the
+same block table, and the paged-attention kernel already gives every row its own length.
+Greedy acceptance keeps the longest draft prefix matching the model's own argmax plus one bonus
+token, so output is **token-identical** to normal decoding (differential test in
+[`tests/test_cuda_graphs.py`](tests/test_cuda_graphs.py)). Drafting is adaptive. A sequence whose
+drafts keep missing, or whose lookups find nothing 4 times in a row, goes "cold" and stays on the
+overlap pipeline, and it is re-probed every 32 tokens, so open-ended text pays nothing.
+
+| In-process, 200 output tokens | Spec off | **Spec on (K=4)** | Draft acceptance |
+|---|---:|---:|---:|
+| Copy-heavy (repeat a passage), 1 stream | 117.1 tok/s | **227.0 (1.9×)** | 94% |
+| Copy-heavy, 8 streams | 736.4 tok/s | **1,142.3 (1.55×)** | 94% |
+| Open-ended (explain TCP), 1 stream | 132.9 tok/s | 133.1 (no change) | (no drafts) |
+| Open-ended, 8 streams | 881.1 tok/s | 866.3 (within noise) | (no drafts) |
+
+Copy-heavy is the RAG / summarise / quote / code-edit pattern. The first version disabled the
+overlap pipeline whenever speculation was on, which cost open-ended text 8–10%. Making
+speculation per-sequence adaptive and letting cold batches pipeline removed that loss.
+
 ### Overlap scheduler
 
 After CUDA graphs, a batch-64 decode step was still about a third host time: reading the sampled
@@ -447,7 +471,7 @@ Each phase shipped finished and demoable, with benchmark numbers, before the nex
 5. **Production polish** ✅: Prometheus `/metrics`, a live dashboard website, Docker, GitHub
    Actions CI, and README charts.
 
-**Possible next steps:** speculative decoding, and split-K (FlashDecoding-style) parallelism
+**Possible next steps:** draft-model speculative decoding (for open-ended text), and split-K (FlashDecoding-style) parallelism
 in the paged-attention kernel for long contexts at small batch sizes.
 
 ## Stack: what and why

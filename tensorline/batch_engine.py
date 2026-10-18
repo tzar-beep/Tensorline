@@ -64,6 +64,11 @@ class Sequence:
     num_computed: int = 0      # tokens whose K/V is in the cache
     hashes: list[int] = field(default_factory=list)   # content hashes of its full, computed blocks
     done: bool = False
+    ngrams: dict = field(default_factory=dict)        # n-gram -> position of the token after it
+    ngram_upto: int = 0
+    spec_prop: int = 0
+    spec_acc: int = 0
+    spec_miss: int = 0                                # consecutive lookups that found no draft
 
     @property
     def num_generated(self) -> int:
@@ -77,7 +82,7 @@ class BatchEngine(Engine):
                  max_batched_tokens: int = 2048, max_model_len: int = 4096,
                  cuda_graphs: bool = True, prefix_caching: bool = True,
                  quant: str | None = None, kv_cache_gb: float | None = None,
-                 graph_warmup_tokens: int = 512, overlap: bool = True):
+                 graph_warmup_tokens: int = 512, overlap: bool = True, spec_tokens: int = 0):
         super().__init__(model_id, device, dtype, quant)
         if self.quant and self.device == "cuda":
             self._warm_quant_kernels(max_num_seqs)
@@ -122,6 +127,10 @@ class BatchEngine(Engine):
         self._aborted: list[Sequence] = []
         # Overlap scheduler (CUDA-graph decode only): step t+1 is launched before step t's tokens
         # are read back; `_inflight` = (seqs, sampled-token tensor on GPU, pinned host copy, event).
+        # Speculative decoding (prompt-lookup drafts, verified inside the CUDA-graph decode batch).
+        # Speculative steps are synchronous, so it replaces the overlap pipeline when enabled.
+        self.spec_tokens = spec_tokens if self.graphs is not None else 0
+        self.spec_proposed = self.spec_accepted = self.spec_steps = 0
         self.overlap = overlap and self.graphs is not None
         self._inflight = None
         self._tok_host = ([torch.empty(max_num_seqs, dtype=torch.long).pin_memory() for _ in range(2)]
@@ -396,6 +405,76 @@ class BatchEngine(Engine):
         if seq.num_generated >= seq.params.max_tokens or len(seq.tokens) >= self.max_model_len:
             self._finish(seq, "length")
 
+    # ---- speculative decoding ----
+    NGRAM = 3
+
+    def _propose(self, seq: Sequence, k: int) -> list[int]:
+        """Prompt-lookup draft: if the last NGRAM tokens occurred earlier in the context, propose
+        the (up to k) tokens that followed that occurrence. The n-gram index is updated
+        incrementally, so each lookup is O(1) amortised."""
+        t, n = seq.tokens, self.NGRAM
+        for i in range(seq.ngram_upto, len(t) - n):
+            seq.ngrams[tuple(t[i:i + n])] = i + n          # latest occurrence wins
+        seq.ngram_upto = max(seq.ngram_upto, len(t) - n)
+        pos = seq.ngrams.get(tuple(t[-n:]))
+        return t[pos:pos + k] if pos is not None else []
+
+    def _spec_cold(self, s: Sequence) -> bool:
+        """Adaptive: drafting stops for a sequence whose drafts keep being rejected or whose
+        lookups keep finding nothing (open-ended text), so it returns to the overlapped pipeline
+        instead of paying for verification. It is re-probed every 32 generated tokens."""
+        if s.num_generated % 32 == 0:
+            return False
+        return (s.spec_prop >= 16 and s.spec_acc < 0.3 * s.spec_prop) or s.spec_miss >= 4
+
+    def _spec_step(self, plan) -> bool:
+        """One verification step for a pure greedy decode batch. Each sequence contributes its
+        last token plus its draft as separate rows of the graph-decoded batch (row j sits at
+        position start+j and attends to the same block table up to its own length). The longest
+        draft prefix matching the model's own argmax is accepted, plus one bonus token, so the
+        output is token-identical to plain greedy decoding. Returns False if nothing was drafted."""
+        seqs = [s for s, _ in plan]
+        room = self.graphs.batch_buckets[-1] - len(seqs)
+        drafts = []
+        for s in seqs:
+            limit = min(self.spec_tokens, room, s.params.max_tokens - s.num_generated - 1,
+                        self.max_model_len - len(s.tokens) - 1)
+            d = self._propose(s, limit) if limit > 0 and not self._spec_cold(s) else []
+            s.spec_miss = 0 if d else s.spec_miss + 1
+            if d and not self._grow(s, s.num_computed + 1 + len(d)):
+                d = []
+            room -= len(d)
+            drafts.append(d)
+        if not any(drafts):
+            return False
+        chunks, offs = [], []
+        for s, d in zip(seqs, drafts):
+            offs.append(len(chunks))
+            for j, tok in enumerate([s.tokens[-1]] + d):
+                chunks.append(SeqChunk([tok], s.num_computed + j, s.blocks, True))
+        if not self.graphs.can_run(chunks):
+            return False
+        preds = self.graphs.run(chunks).argmax(dim=-1).tolist()
+        self.steps += 1
+        self.spec_steps += 1
+        self.metrics.batch.observe(len(chunks))
+        now = time.perf_counter()
+        for s, d, off in zip(seqs, drafts, offs):
+            a = 0
+            while a < len(d) and d[a] == preds[off + a]:
+                a += 1
+            self.spec_proposed += len(d)
+            self.spec_accepted += a
+            s.spec_prop += len(d)
+            s.spec_acc += a
+            s.num_computed += 1 + a                         # KV past this is stale; overwritten later
+            self._publish_full_blocks(s)
+            for tok in d[:a] + [preds[off + a]]:
+                self._accept(s, tok, now)
+                if s.done:
+                    break
+        return True
+
     # ---- overlap scheduler ----
     def _overlappable(self, plan, chunks) -> bool:
         return (self.overlap and all(s.params.temperature <= 0 for s, _ in plan)
@@ -433,6 +512,8 @@ class BatchEngine(Engine):
         seqs = [s for s in self._inflight[0] if not s.done]
         if not seqs or self.waiting or self._aborted or len(seqs) != len(self.running):
             return False
+        if self.spec_tokens and not all(self._spec_cold(s) for s in seqs):
+            return False                             # someone may draft: go through _spec_step
         for s in seqs:   # the pending token gets appended at resolve; leave room for one more
             if (s.params.temperature > 0 or s.num_generated + 2 > s.params.max_tokens
                     or len(s.tokens) + 2 > self.max_model_len):
@@ -476,7 +557,10 @@ class BatchEngine(Engine):
                     continue
                 chunks = [SeqChunk(s.tokens[s.num_computed:s.num_computed + n], s.num_computed, s.blocks,
                                    want_logits=s.num_computed + n == len(s.tokens)) for s, n in plan]
-                if self._overlappable(plan, chunks):
+                if (self.spec_tokens and all(s.params.temperature <= 0 for s, _ in plan)
+                        and self.graphs.can_run(chunks) and self._spec_step(plan)):
+                    pass
+                elif self._overlappable(plan, chunks):
                     self._inflight = self._launch([s for s, _ in plan], chunks)
                 else:
                     self._step(plan)

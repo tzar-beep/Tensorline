@@ -99,3 +99,27 @@ def test_overlap_scheduler_matches_synchronous():
     assert pipe == sync
     assert {r[1] for r in sync} == {"stop", "length"}       # both stop kinds exercised
     assert no_leak
+
+
+def test_speculative_decoding_is_token_identical():
+    """Prompt-lookup drafts verified in the graph batch must reproduce plain greedy decoding."""
+    from tests.test_batching import run_concurrent
+    passage = ("The paged KV cache stores keys and values in fixed-size blocks. Each sequence owns a "
+               "block table. Blocks are allocated on demand and freed when the sequence finishes.")
+    prompts = [f"Repeat this passage exactly, twice:\n{passage}",
+               f"Quote the second sentence of this text verbatim, then the first:\n{passage}",
+               "Count from one to thirty, separated by commas.",
+               "Explain what a mutex is."]
+    out, stats = {}, {}
+    for k in (0, 4):
+        eng = BatchEngine(QWEN, device="cuda", num_blocks=512, spec_tokens=k, graph_warmup_tokens=256)
+        jobs = [(eng.render_chat([{"role": "user", "content": p}]), 120) for p in prompts]
+        texts, st = run_concurrent(eng, jobs)
+        out[k] = [(t, s.finish_reason, s.completion_tokens) for t, s in zip(texts, st)]
+        stats[k] = (eng.spec_steps, eng.spec_accepted, eng.alloc.num_free == eng.alloc.num_blocks)
+        eng.shutdown()
+        del eng
+        torch.cuda.empty_cache()
+    assert out[4] == out[0]
+    steps, accepted, no_leak = stats[4]
+    assert steps > 0 and accepted > 0 and no_leak
