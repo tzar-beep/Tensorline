@@ -57,3 +57,45 @@ def test_engine_with_graphs_matches_eager_engine():
         del eng
         torch.cuda.empty_cache()
     assert out[True] == out[False]
+
+
+def test_overlap_scheduler_matches_synchronous():
+    """Launching step t+1 before reading back step t must not change a single token, finish
+    reason or count: mixed EOS stops, token limits, and arrivals while decoding is pipelined."""
+    import threading
+    import time as _time
+    from tensorline.engine import GenStats, SamplingParams
+    prompts = ["Reply with only the word yes.", "Count from one to fifty in words.",
+               "Name three colours.", "Explain what a mutex is.", "Say hi.",
+               "Write a haiku about GPUs.", "List the planets.", "What is 2+2? Answer briefly."]
+    limits = [64, 40, 24, 96, 8, 50, 70, 30]
+
+    def run(overlap):
+        eng = BatchEngine(QWEN, device="cuda", num_blocks=512, overlap=overlap, graph_warmup_tokens=256)
+        out = [None] * len(prompts)
+
+        def go(i):
+            st = GenStats()
+            text = "".join(eng.stream(eng.render_chat([{"role": "user", "content": prompts[i]}]),
+                                      SamplingParams(limits[i]), st))
+            out[i] = (text, st.finish_reason, st.completion_tokens)
+
+        ts = []
+        for i in range(len(prompts)):          # staggered arrivals hit the pipeline mid-flight
+            ts.append(threading.Thread(target=go, args=(i,)))
+            ts[-1].start()
+            _time.sleep(0.05)
+        for t in ts:
+            t.join(timeout=120)
+        stats = (eng.overlapped_steps, eng.alloc.num_free == eng.alloc.num_blocks)
+        eng.shutdown()
+        del eng
+        torch.cuda.empty_cache()
+        return out, stats
+
+    sync, (sync_overlapped, _) = run(False)
+    pipe, (pipe_overlapped, no_leak) = run(True)
+    assert sync_overlapped == 0 and pipe_overlapped > 0
+    assert pipe == sync
+    assert {r[1] for r in sync} == {"stop", "length"}       # both stop kinds exercised
+    assert no_leak

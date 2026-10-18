@@ -63,6 +63,7 @@ class Sequence:
     blocks: list[int] = field(default_factory=list)
     num_computed: int = 0      # tokens whose K/V is in the cache
     hashes: list[int] = field(default_factory=list)   # content hashes of its full, computed blocks
+    done: bool = False
 
     @property
     def num_generated(self) -> int:
@@ -76,7 +77,7 @@ class BatchEngine(Engine):
                  max_batched_tokens: int = 2048, max_model_len: int = 4096,
                  cuda_graphs: bool = True, prefix_caching: bool = True,
                  quant: str | None = None, kv_cache_gb: float | None = None,
-                 graph_warmup_tokens: int = 512):
+                 graph_warmup_tokens: int = 512, overlap: bool = True):
         super().__init__(model_id, device, dtype, quant)
         if self.quant and self.device == "cuda":
             self._warm_quant_kernels(max_num_seqs)
@@ -119,6 +120,14 @@ class BatchEngine(Engine):
         self.metrics = EngineMetrics()
         self._pending: list[tuple[_Sink, object]] = []   # outputs produced during this step
         self._aborted: list[Sequence] = []
+        # Overlap scheduler (CUDA-graph decode only): step t+1 is launched before step t's tokens
+        # are read back; `_inflight` = (seqs, sampled-token tensor on GPU, pinned host copy, event).
+        self.overlap = overlap and self.graphs is not None
+        self._inflight = None
+        self._tok_host = ([torch.empty(max_num_seqs, dtype=torch.long).pin_memory() for _ in range(2)]
+                          if self.overlap else None)
+        self._flip = 0
+        self.overlapped_steps = 0
         self._stop = False
         self._thread = threading.Thread(target=self._loop, daemon=True, name="tl-scheduler")
         self._thread.start()
@@ -263,7 +272,9 @@ class BatchEngine(Engine):
 
     def _publish_full_blocks(self, seq: Sequence) -> None:
         bs = self.block_size
-        while len(seq.hashes) < seq.num_computed // bs:
+        # With overlap, KV can be computed for a position whose token id is still on the GPU,
+        # so only blocks whose tokens are all known on the host can be hashed.
+        while len(seq.hashes) < min(seq.num_computed, len(seq.tokens)) // bs:
             i = len(seq.hashes)
             h = block_hash(seq.hashes[-1] if i else None, seq.tokens[i * bs:(i + 1) * bs])
             seq.hashes.append(h)
@@ -286,6 +297,7 @@ class BatchEngine(Engine):
             else:
                 continue              # already finished
             self._release(seq)
+            seq.done = True
             seq.stats.finish_reason = "abort"
             self.metrics.requests_finished["abort"] = self.metrics.requests_finished.get("abort", 0) + 1
         self._aborted.clear()
@@ -335,6 +347,7 @@ class BatchEngine(Engine):
         return plan
 
     def _finish(self, seq: Sequence, reason: str) -> None:
+        seq.done = True
         seq.stats.finish_reason = reason
         seq.stats.completion_tokens = seq.num_generated
         seq.stats.total_s = time.perf_counter() - seq.t_submit
@@ -368,30 +381,108 @@ class BatchEngine(Engine):
         now = time.perf_counter()
         for i, seq in enumerate(sampled):
             tok = greedy[i] if seq.params.temperature <= 0 else sample(logits[i], seq.params)
-            if seq.num_generated == 0:
-                seq.stats.ttft_s = now - seq.t_submit
-                self.metrics.ttft.observe(seq.stats.ttft_s)
-            if tok in seq.stops:
-                self._finish(seq, "stop")
+            self._accept(seq, tok, now)
+
+    def _accept(self, seq: Sequence, tok: int, now: float) -> None:
+        if seq.num_generated == 0:
+            seq.stats.ttft_s = now - seq.t_submit
+            self.metrics.ttft.observe(seq.stats.ttft_s)
+        if tok in seq.stops:
+            self._finish(seq, "stop")
+            return
+        seq.tokens.append(tok)
+        self.metrics.tokens_generated += 1
+        self._emit(seq, tok)
+        if seq.num_generated >= seq.params.max_tokens or len(seq.tokens) >= self.max_model_len:
+            self._finish(seq, "length")
+
+    # ---- overlap scheduler ----
+    def _overlappable(self, plan, chunks) -> bool:
+        return (self.overlap and all(s.params.temperature <= 0 for s, _ in plan)
+                and self.graphs.can_run(chunks))
+
+    def _launch(self, seqs: list[Sequence], chunks: list[SeqChunk], dev_ids=None):
+        """Replay a decode graph and start the token readback without waiting for it."""
+        logits = self.graphs.run(chunks, dev_ids)
+        tok_dev = logits.argmax(dim=-1)
+        host = self._tok_host[self._flip][:len(seqs)]
+        self._flip ^= 1                              # double-buffered: t's readback vs t+1's
+        host.copy_(tok_dev, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        for seq in seqs:
+            seq.num_computed += 1
+        self.steps += 1
+        self.max_running_seen = max(self.max_running_seen, len(self.running))
+        self.metrics.batch.observe(len(seqs))
+        return seqs, tok_dev, host, ev
+
+    def _resolve(self, inflight) -> None:
+        seqs, _, host, ev = inflight
+        ev.synchronize()
+        toks = host.tolist()
+        now = time.perf_counter()
+        for seq, tok in zip(seqs, toks):
+            if seq.done:                             # finished one step earlier: wasted token
                 continue
-            seq.tokens.append(tok)
-            self.metrics.tokens_generated += 1
-            self._emit(seq, tok)
-            if seq.num_generated >= seq.params.max_tokens or len(seq.tokens) >= self.max_model_len:
-                self._finish(seq, "length")
+            self._publish_full_blocks(seq)   # before accept, like the sync path: a finishing
+            self._accept(seq, tok, now)      # sequence releases its blocks inside _accept
+
+    def _can_continue(self) -> bool:
+        """Steady-state decode: can step t+1 be launched before step t is read back? (Holds _cv.)"""
+        seqs = [s for s in self._inflight[0] if not s.done]
+        if not seqs or self.waiting or self._aborted or len(seqs) != len(self.running):
+            return False
+        for s in seqs:   # the pending token gets appended at resolve; leave room for one more
+            if (s.params.temperature > 0 or s.num_generated + 2 > s.params.max_tokens
+                    or len(s.tokens) + 2 > self.max_model_len):
+                return False
+        return all(self._grow(s, s.num_computed + 1) for s in seqs)
+
+    def _continue(self) -> None:
+        """Launch step t+1 from step t's on-GPU tokens, then read back and process step t."""
+        prev = self._inflight
+        seqs, tok_dev = prev[0], prev[1]
+        live = [i for i, s in enumerate(seqs) if not s.done]
+        nxt = [seqs[i] for i in live]
+        ids = tok_dev if len(live) == len(seqs) else tok_dev[torch.tensor(live, device=tok_dev.device)]
+        chunks = [SeqChunk([0], s.num_computed, s.blocks, True) for s in nxt]
+        self._inflight = self._launch(nxt, chunks, ids)
+        self.overlapped_steps += 1
+        self._resolve(prev)
 
     def _loop(self) -> None:
         while not self._stop:
             try:
                 with self._cv:            # only the queues are shared with request threads
-                    while not self.waiting and not self.running and not self._aborted and not self._stop:
+                    while (not self.waiting and not self.running and not self._aborted
+                           and not self._stop and self._inflight is None):
                         self._cv.wait()
                     if self._stop:
                         return
+                    cont = self._inflight is not None and self._can_continue()
+                if cont:
+                    self._continue()
+                    self._flush()
+                    continue
+                if self._inflight is not None:  # leaving steady state: catch up synchronously
+                    prev, self._inflight = self._inflight, None
+                    self._resolve(prev)
+                    self._flush()
+                with self._cv:
                     plan = self._schedule()
-                self._step(plan)
+                if not plan:
+                    self._flush()                # e.g. a "does not fit" error emitted by _schedule
+                    continue
+                chunks = [SeqChunk(s.tokens[s.num_computed:s.num_computed + n], s.num_computed, s.blocks,
+                                   want_logits=s.num_computed + n == len(s.tokens)) for s, n in plan]
+                if self._overlappable(plan, chunks):
+                    self._inflight = self._launch([s for s, _ in plan], chunks)
+                else:
+                    self._step(plan)
                 self._flush()
             except Exception as e:  # fail every in-flight request rather than hang them
+                self._inflight = None
                 with self._cv:
                     for seq in self.running + list(self.waiting):
                         self._release(seq)

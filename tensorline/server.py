@@ -265,6 +265,8 @@ def main():
     ap.add_argument("--max-batched-tokens", type=int, default=2048)
     ap.add_argument("--num-blocks", type=int, default=None, help="KV blocks (default: fit 60%% of free VRAM)")
     ap.add_argument("--no-cuda-graphs", action="store_true", help="run decode steps eagerly")
+    ap.add_argument("--no-overlap", action="store_true",
+                    help="read each decode step's tokens back before launching the next")
     ap.add_argument("--graph-warmup-tokens", type=int, default=512,
                     help="pre-capture decode CUDA graphs for contexts up to this many tokens (0 = lazy)")
     ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse KV blocks across requests")
@@ -293,7 +295,7 @@ def main():
                              cuda_graphs=not a.no_cuda_graphs,
                              prefix_caching=not a.no_prefix_caching,
                              quant=a.quant, kv_cache_gb=a.kv_cache_gb,
-                             graph_warmup_tokens=a.graph_warmup_tokens)
+                             graph_warmup_tokens=a.graph_warmup_tokens, overlap=not a.no_overlap)
     uvicorn.run(create_app(engine), host=a.host, port=a.port)
 
 

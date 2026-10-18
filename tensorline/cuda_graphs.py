@@ -96,7 +96,10 @@ class CudaGraphDecoder:
         return len(self.graphs)
 
     @torch.inference_mode()
-    def run(self, chunks: list[SeqChunk]) -> torch.Tensor:
+    def run(self, chunks: list[SeqChunk], dev_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Replay the bucket's graph. `dev_ids` (optional, [n] on the GPU) overrides the chunks'
+        token ids with a device-to-device copy, used by the overlap scheduler to feed step t's
+        sampled tokens into step t+1 without a round trip through the host."""
         n = len(chunks)
         B = _bucket(n, self.batch_buckets)
         NB = _bucket(max(len(c.block_table) for c in chunks), self.block_buckets)
@@ -116,6 +119,8 @@ class CudaGraphDecoder:
             vals[row:row + len(c.block_table)] = c.block_table
         host.copy_(torch.tensor(vals, dtype=torch.long))
         buf.copy_(host, non_blocking=True)
+        if dev_ids is not None:
+            buf[:n].copy_(dev_ids)
         g.replay()
         self.replays += 1
         return self.out[:n]

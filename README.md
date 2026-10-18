@@ -13,7 +13,7 @@ benchmark.
 - **3.2× Ollama's throughput at 64 concurrent requests** (2,487 vs 785 tok/s) and 2.7× at 16, with the same model and GPU, run back to back. Tensorline leads from 4 concurrent requests up and is within 3% single-stream.
 - **80× over naive one-at-a-time serving** at peak (15.8 → 1,259 tok/s, back to back), through a paged KV cache, continuous batching and CUDA graphs; later optimisations reach 2,487 tok/s.
 - **Serves a 3B model that does not fit in VRAM at fp16** (808 tok/s), using hand-written fused int4/int8 Triton kernels (int8: lossless perplexity).
-- **Correctness by differential testing**: the paged engine is token-identical to a reference engine under chunked prefill, preemption and prefix sharing; 70 tests (the CPU subset runs in CI; GPU tests run locally).
+- **Correctness by differential testing**: the paged engine is token-identical to a reference engine under chunked prefill, preemption, prefix sharing and overlapped scheduling; 87 tests (the CPU subset runs in CI; GPU tests run locally).
 
 ## Quickstart
 
@@ -139,6 +139,30 @@ out of the layer loop.
 |---|---:|---:|
 | Prefill step, in-process | 680 ms | **171 ms** |
 | In-server burst: throughput / TTFT (warm) | 2,783 tok/s / 1,076 ms | **3,205 tok/s / 562 ms** |
+
+### Overlap scheduler
+
+After CUDA graphs, a batch-64 decode step was still about a third host time: reading the sampled
+tokens back, stop checks, streaming and scheduling, all while the GPU sat idle. In steady-state
+decode, the engine now **launches step t+1 before reading back step t**
+([`batch_engine.py`](tensorline/batch_engine.py) `_continue`). Step t's argmax stays on the GPU
+and is copied device-to-device into step t+1's graph inputs. The readback goes into one of two
+alternating pinned buffers (so t's readback can't race t+1's) and is processed while the GPU runs
+t+1. A sequence that stopped at step t gets one wasted token in t+1, which is discarded.
+Prefix-cache publishing is capped at the tokens actually known on the host. Anything outside
+steady state (new arrivals, aborts, sampling, a sequence about to hit its limit) drains the
+pipeline and runs synchronously.
+
+| In-process, 64 sequences × 128 tokens | Synchronous | **Overlapped** |
+|---|---:|---:|
+| Throughput | 3,565 tok/s | **4,118 tok/s (+15.5%)** |
+| Step time | 17.8 ms | **15.4 ms** |
+
+A differential test runs a mix of EOS stops, token limits and staggered arrivals with overlap on
+and off, and requires identical text, finish reasons and token counts, plus no leaked blocks
+([`tests/test_cuda_graphs.py`](tests/test_cuda_graphs.py)). It also caught a real bug during
+development: a sequence finishing mid-resolve had its blocks released before the prefix-cache
+publish ran.
 
 ### Paged-attention decode kernel
 
@@ -401,8 +425,7 @@ Each phase shipped finished and demoable, with benchmark numbers, before the nex
 5. **Production polish** ✅: Prometheus `/metrics`, a live dashboard website, Docker, GitHub
    Actions CI, and README charts.
 
-**Possible next steps:** an overlap scheduler (build step t+1's inputs while step t's graph runs,
-hiding the remaining host time per step), speculative decoding, and split-K (FlashDecoding-style) parallelism
+**Possible next steps:** speculative decoding, and split-K (FlashDecoding-style) parallelism
 in the paged-attention kernel for long contexts at small batch sizes.
 
 ## Stack: what and why
