@@ -23,7 +23,13 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install -e .[dev]
 tensorline --model Qwen/Qwen2.5-0.5B-Instruct          # serves on http://127.0.0.1:8000
 tensorline --engine naive                               # Phase 1 one-at-a-time baseline
+tensorline --model Qwen/Qwen2.5-1.5B-Instruct --quant int4      # fused W4A16 kernels
+tensorline --serve small=Qwen/Qwen2.5-0.5B-Instruct --serve big=Qwen/Qwen2.5-1.5B-Instruct:int4  # multi-model
 ```
+
+Open `http://127.0.0.1:8000/` for the live dashboard. Defaults: CUDA graphs (pre-captured to
+512 tokens), overlap scheduling, prefix caching and prompt-lookup speculation (`--spec-tokens 4`);
+each has a flag to turn it off (`tensorline --help`).
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
@@ -82,6 +88,8 @@ What the numbers show:
 
 ### vs Ollama (Phase 4)
 
+![Tensorline vs Ollama, short requests](docs/vs_ollama.svg)
+
 Both servers run the same model, Qwen2.5-0.5B-Instruct fp16, on the same GPU with the same
 client (`bench/bench.py`, OpenAI API, streaming, 128 output tokens), back to back via
 [`bench/run_vs_ollama.sh`](bench/run_vs_ollama.sh). Ollama 0.35.1 runs with all layers on the GPU,
@@ -102,6 +110,8 @@ single stream, down from 24% before the kernel and scheduling work below. From 4
 requests up, Tensorline leads: 2.7× at 16 and **3.2× at 64**, with a third of the p99 latency.
 Ollama queues everything beyond its fixed slots, while Tensorline's paged KV cache and
 iteration-level scheduler admit every request.
+
+![Tensorline vs Ollama, long-context requests](docs/vs_ollama_long.svg)
 
 **Long-context workload.** The table above uses short prompts and 128 output tokens, which barely
 exercises the KV cache. This one sends a unique ~880-token document per request, unique across
@@ -124,6 +134,13 @@ At 64 concurrent requests it does 4× Ollama's throughput, and median TTFT is 0.
 Tensorline's weak spot here is tail TTFT (p99 4.3 s at 64): 64 × 880 prompt tokens go through
 a 2,048-token-per-step prefill budget, so the last arrivals wait several steps. Raising
 `--max-batched-tokens` trades that against decode stalls.
+
+> Power state matters on a laptop. A later re-run of the short-request comparison, after the
+> overlap scheduler and speculative decoding landed, happened to run **on battery** (GPU
+> power-limited), so both systems were slower in absolute terms. The ratio held, though, with
+> Tensorline ahead 1.10× / 1.17× / 3.3× / 4.0× at 1 / 4 / 16 / 64
+> ([Tensorline](bench/results/vs_tensorline_battery.json), [Ollama](bench/results/vs_ollama_p16_battery.json)).
+> All published tables are plugged-in runs.
 
 > Methodology bug found and fixed: earlier runs of this comparison showed Tensorline swinging
 > between 1,014 and 1,795 tok/s at concurrency 64. The dashboard exposed the cause: a KV cache of

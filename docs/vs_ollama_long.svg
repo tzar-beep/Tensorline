@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 360" width="720" height="360" role="img" aria-labelledby="t d" font-family="system-ui,-apple-system,Segoe UI,sans-serif">
+<title id="t">Tensorline vs Ollama · long-context requests</title>
+<desc id="d">Same model and GPU, back to back; unique ~880-token prompts, 512 output tokens.</desc>
+<style>.bg{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.grid{stroke:#e4e3df}.s0{stroke:#2a78d6;fill:#2a78d6}.s1{stroke:#eb6834;fill:#eb6834}.ln{fill:none;stroke-width:2}.mk{stroke:#fcfcfb;stroke-width:2}@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}.ink{fill:#f0efec}.ink2{fill:#c3c2b7}.grid{stroke:#33332f}.mk{stroke:#1a1a19}.s0{stroke:#3987e5;fill:#3987e5}.s1{stroke:#d95926;fill:#d95926}}</style>
+<rect class="bg" width="720" height="360" rx="8"/>
+<text class="ink" x="64" y="26" font-size="15" font-weight="600">Tensorline vs Ollama · long-context requests</text>
+<line class="grid" x1="64" x2="510" y1="312.0" y2="312.0"/>
+<text class="ink2" x="56" y="316.0" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="64" x2="510" y1="246.0" y2="246.0"/>
+<text class="ink2" x="56" y="250.0" font-size="11" text-anchor="end">750</text>
+<line class="grid" x1="64" x2="510" y1="180.0" y2="180.0"/>
+<text class="ink2" x="56" y="184.0" font-size="11" text-anchor="end">1,500</text>
+<line class="grid" x1="64" x2="510" y1="114.0" y2="114.0"/>
+<text class="ink2" x="56" y="118.0" font-size="11" text-anchor="end">2,250</text>
+<line class="grid" x1="64" x2="510" y1="48.0" y2="48.0"/>
+<text class="ink2" x="56" y="52.0" font-size="11" text-anchor="end">3,000</text>
+<text class="ink2" x="64.0" y="330" font-size="11" text-anchor="middle">1</text>
+<text class="ink2" x="287.0" y="330" font-size="11" text-anchor="middle">16</text>
+<text class="ink2" x="510.0" y="330" font-size="11" text-anchor="middle">64</text>
+<text class="ink2" x="287.0" y="350" font-size="11" text-anchor="middle">concurrent requests · output tokens/s</text>
+<path class="ln s0" d="M64.0,300.8 L287.0,189.4 L510.0,77.6"/>
+<circle class="mk s0" cx="64.0" cy="300.8" r="4.5"><title>Tensorline: 127 tok/s at 1 concurrent</title></circle>
+<circle class="mk s0" cx="287.0" cy="189.4" r="4.5"><title>Tensorline: 1,393 tok/s at 16 concurrent</title></circle>
+<circle class="mk s0" cx="510.0" cy="77.6" r="4.5"><title>Tensorline: 2,664 tok/s at 64 concurrent</title></circle>
+<path class="ln s1" d="M64.0,301.6 L287.0,252.9 L510.0,252.9"/>
+<circle class="mk s1" cx="64.0" cy="301.6" r="4.5"><title>Ollama (16 slots): 118 tok/s at 1 concurrent</title></circle>
+<circle class="mk s1" cx="287.0" cy="252.9" r="4.5"><title>Ollama (16 slots): 671 tok/s at 16 concurrent</title></circle>
+<circle class="mk s1" cx="510.0" cy="252.9" r="4.5"><title>Ollama (16 slots): 672 tok/s at 64 concurrent</title></circle>
+<circle class="s0" cx="524" cy="77.6" r="4"/>
+<text class="ink" x="534" y="81.6" font-size="12">Tensorline · 2,664</text>
+<circle class="s1" cx="524" cy="252.9" r="4"/>
+<text class="ink" x="534" y="256.9" font-size="12">Ollama (16 slots) · 672</text>
+</svg>
