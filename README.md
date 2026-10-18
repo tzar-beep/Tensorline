@@ -10,7 +10,7 @@ benchmark.
 > Status: **all five phases complete.** Everything below was measured on one RTX 3050 Laptop GPU (6 GB).
 
 **Highlights**
-- **3.2× Ollama's throughput at 64 concurrent requests** (2,487 vs 785 tok/s) and 2.7× at 16, with the same model and GPU, run back to back. Tensorline leads from 4 concurrent requests up and is within 3% single-stream.
+- **4.0× Ollama's throughput on long-context requests at 64 concurrency** (2,664 vs 672 tok/s; ~880-token unique prompts, 512 output tokens), faster even single-stream; 3.2× on short requests. Same model and GPU, run back to back.
 - **80× over naive one-at-a-time serving** at peak (15.8 → 1,259 tok/s, back to back), through a paged KV cache, continuous batching and CUDA graphs; later optimisations reach 2,487 tok/s.
 - **Serves a 3B model that does not fit in VRAM at fp16** (808 tok/s), using hand-written fused int4/int8 Triton kernels (int8: lossless perplexity).
 - **Correctness by differential testing**: the paged engine is token-identical to a reference engine under chunked prefill, preemption, prefix sharing and overlapped scheduling; 87 tests (the CPU subset runs in CI; GPU tests run locally).
@@ -102,6 +102,28 @@ single stream, down from 24% before the kernel and scheduling work below. From 4
 requests up, Tensorline leads: 2.7× at 16 and **3.2× at 64**, with a third of the p99 latency.
 Ollama queues everything beyond its fixed slots, while Tensorline's paged KV cache and
 iteration-level scheduler admit every request.
+
+**Long-context workload.** The table above uses short prompts and 128 output tokens, which barely
+exercises the KV cache. This one sends a unique ~880-token document per request, unique across
+levels too (2–3% of prompt tokens cached: the chat template only), and asks for 512 output
+tokens, so contexts reach ~1,400 tokens. Ollama got a 2,048-token context per slot and
+Tensorline pre-captured graphs to 2,048 tokens
+(`LEVELS="1 16 64" BENCH_ARGS="--prompt-words 800 --max-tokens 512" OLLAMA_CTX=2048 SUFFIX=_heavy TL_ARGS="--graph-warmup-tokens 2048" bash bench/run_vs_ollama.sh`).
+
+| Concurrency | Ollama tok/s | **Tensorline tok/s** | Ollama TTFT p50 | **Tensorline TTFT p50** | Ollama latency p99 | **Tensorline latency p99** |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1  | 118.3 | **127.0** (1.07×) | 115 ms | **77 ms** | 4.36 s | **4.05 s** |
+| 16 | 671.2 | **1392.9** (2.1×) | 469 ms | **443 ms** | 13.26 s | **6.57 s** |
+| 64 | 671.8 | **2663.7** (4.0×) | 32.79 s | **649 ms** | 50.43 s | **15.91 s** |
+
+([Tensorline](bench/results/vs_tensorline_heavy.json), [Ollama](bench/results/vs_ollama_p16_heavy.json).)
+With long contexts, Tensorline leads even single-stream. The paged-attention kernel reads KV in
+place, while the gather + SDPA path it replaced copied each sequence's padded history every step.
+At 64 concurrent requests it does 4× Ollama's throughput, and median TTFT is 0.65 s against
+32.8 s, because Ollama's 16 slots force the other 48 requests to wait for whole generations.
+Tensorline's weak spot here is tail TTFT (p99 4.3 s at 64): 64 × 880 prompt tokens go through
+a 2,048-token-per-step prefill budget, so the last arrivals wait several steps. Raising
+`--max-batched-tokens` trades that against decode stalls.
 
 > Methodology bug found and fixed: earlier runs of this comparison showed Tensorline swinging
 > between 1,014 and 1,795 tok/s at concurrency 64. The dashboard exposed the cause: a KV cache of

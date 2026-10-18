@@ -78,7 +78,7 @@ async def run_level(url, model, conc, n, max_tokens, system=None, prompt_words=0
         async def task(i):
             async with sem:
                 if prompt_words:
-                    p = long_prompt(i, prompt_words)
+                    p = long_prompt(100_000 * conc + i, prompt_words)   # unique across levels too
                 else:
                     p = PROMPTS[i % len(PROMPTS)]
                     p = f"[{i}] {p}" if system else p

@@ -7,38 +7,38 @@
     {
       "concurrency": 1,
       "requests": 16,
-      "ttft_p50_ms": 141.39280000017607,
-      "ttft_p99_ms": 149.2687999998452,
-      "lat_p50_s": 5.48626510000031,
-      "lat_p99_s": 5.576967099998001,
-      "throughput_tok_s": 93.21222186925829,
-      "per_req_tok_s": 93.22441516319597,
-      "prompt_tokens_mean": 884.5,
-      "cached_prompt_frac": 0.027133973996608253
+      "ttft_p50_ms": 114.66570000266074,
+      "ttft_p99_ms": 118.50739999863436,
+      "lat_p50_s": 4.3210902999999234,
+      "lat_p99_s": 4.363964699998178,
+      "throughput_tok_s": 118.27747016371083,
+      "per_req_tok_s": 118.2964991589978,
+      "prompt_tokens_mean": 887.9375,
+      "cached_prompt_frac": 0.027028929400999508
     },
     {
       "concurrency": 16,
       "requests": 32,
-      "ttft_p50_ms": 253.30449999819393,
-      "ttft_p99_ms": 2251.99590000193,
-      "lat_p50_s": 11.915940800001408,
-      "lat_p99_s": 13.389478500001132,
-      "throughput_tok_s": 681.5538086899546,
-      "per_req_tok_s": 43.85386765732412,
-      "prompt_tokens_mean": 884.75,
-      "cached_prompt_frac": 0.5141282848262221
+      "ttft_p50_ms": 468.82560000085505,
+      "ttft_p99_ms": 2001.4155999997456,
+      "lat_p50_s": 11.930325499997707,
+      "lat_p99_s": 13.259718100001919,
+      "throughput_tok_s": 671.1560876892871,
+      "per_req_tok_s": 43.142969462198195,
+      "prompt_tokens_mean": 889.125,
+      "cached_prompt_frac": 0.03265148319977506
     },
     {
       "concurrency": 64,
       "requests": 128,
-      "ttft_p50_ms": 34813.97459999789,
-      "ttft_p99_ms": 38006.15190000099,
-      "lat_p50_s": 46.434528599998885,
-      "lat_p99_s": 54.20065649999742,
-      "throughput_tok_s": 638.8776467184673,
-      "per_req_tok_s": 16.867453408132643,
-      "prompt_tokens_mean": 876.984375,
-      "cached_prompt_frac": 0.2741015910346179
+      "ttft_p50_ms": 32793.593899998086,
+      "ttft_p99_ms": 35332.098300001235,
+      "lat_p50_s": 43.76746540000022,
+      "lat_p99_s": 50.428298099999665,
+      "throughput_tok_s": 671.7649027433964,
+      "per_req_tok_s": 16.999452640088638,
+      "prompt_tokens_mean": 888.5703125,
+      "cached_prompt_frac": 0.034096204401382134
     }
   ]
 }
